@@ -19,13 +19,21 @@ class PlannerError(Exception):
 
 class BasePlanner(ABC):
     @abstractmethod
-    def plan(self, job_id: uuid.UUID, prompt: str) -> ExecutionPlan:
+    def plan(
+        self,
+        job_id: uuid.UUID,
+        prompt: str,
+        context: list[str] | None = None,
+    ) -> ExecutionPlan:
         """
         Generate an ExecutionPlan for the given job.
 
         Args:
-            job_id: The UUID of the job being planned.
-            prompt: The user's natural language request.
+            job_id:  The UUID of the job being planned.
+            prompt:  The user's natural language request.
+            context: Optional list of relevant past results retrieved from
+                     memory.  Planners may inject this into the LLM prompt to
+                     avoid redundant work or to reuse prior findings.
 
         Returns:
             A validated ExecutionPlan.

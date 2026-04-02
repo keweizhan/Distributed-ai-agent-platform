@@ -1,32 +1,6 @@
 # Distributed AI Agent Platform
 
-A production-oriented distributed system that accepts natural language requests, generates structured execution plans via LLM, and dispatches tasks asynchronously across worker nodes with tool invocation and sandboxed code execution.
-
-## Architecture
-
-```
-User → FastAPI → PostgreSQL + Redis → Celery Workers → LLM Planner → Executor Workers → Tools
-```
-
-| Component | Technology | Role |
-|-----------|-----------|------|
-| API Server | FastAPI + asyncpg | Accept requests, persist jobs, enqueue work |
-| Task Queue | Celery + Redis | Async task dispatch and routing |
-| Planner Worker | Celery + OpenAI SDK | LLM → structured ExecutionPlan |
-| Executor Worker | Celery | Run task steps via tool registry |
-| Tool: web_search | HTTP (Milestone 3) | Retrieve web results |
-| Tool: code_exec | Docker sandbox | Execute Python safely with timeout |
-| State Store | PostgreSQL | Jobs, tasks, tool I/O, audit trail |
-| Memory Layer | Qdrant (Milestone 6) | Semantic retrieval across past runs |
-
-## Milestones
-
-- [x] **M1** — Scaffold: Docker Compose, DB schema, API skeleton (`POST /jobs`, `GET /jobs/:id`)
-- [x] **M2** — Planner: LLM integration, ExecutionPlan generation, task persistence, mock fallback
-- [ ] **M3** — Executor: Tool registry wiring, web_search integration, dependency-chain dispatch
-- [ ] **M4** — Code sandbox: Docker-in-Docker execution with timeout + stdout capture
-- [ ] **M5** — Streaming: SSE status updates, `GET /jobs/:id/stream`
-- [ ] **M6** — Memory: Qdrant embedding store for cross-run context retrieval
+A production-oriented distributed system that accepts natural language requests, generates structured execution plans via LLM, and dispatches tasks asynchronously across worker nodes with tool invocation, sandboxed code execution, and full Prometheus observability.
 
 ---
 
@@ -37,74 +11,324 @@ cp .env.example .env
 docker compose up --build
 ```
 
-API at `http://localhost:8000` — interactive docs at `http://localhost:8000/docs`
+| Service | URL |
+|---------|-----|
+| API + Swagger UI | http://localhost:8000/docs |
+| Prometheus | http://localhost:9091 |
+| Grafana | http://localhost:3000 (no login required) |
+| Qdrant UI | http://localhost:6333/dashboard (when `MEMORY_ENABLED=true`) |
 
-### Run in mock mode (no API key required)
+The **Agent Platform** Grafana dashboard is pre-loaded under the Agent Platform folder.
 
-Leave `OPENAI_API_KEY=sk-not-set` in `.env`. The MockPlanner kicks in automatically
-and returns a deterministic 3-step plan (search → analyse → synthesise).
+No OpenAI key required — the built-in `MockPlanner` exercises the full execution path without any API calls.
 
-```bash
-# Submit a job
-curl -s -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Research the latest transformer architectures"}' \
-  | jq .
+---
 
-# Poll status (copy id from above)
-curl -s http://localhost:8000/jobs/<job-id> | jq .
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Client                                                         │
+│  POST /auth/register → POST /auth/token → Bearer JWT           │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ HTTPS
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  FastAPI  (api/)                                                │
+│  ├─ /auth  — register, token, me                               │
+│  ├─ /jobs  — submit, list, detail, cancel, task-detail         │
+│  ├─ /health, /ready, /metrics                                  │
+│  └─ workspace-scoped: every query includes WHERE workspace_id  │
+└────────┬──────────────────────┬──────────────────────────────────┘
+         │ write job row        │ enqueue plan_job
+         ▼                      ▼
+┌────────────────┐    ┌──────────────────────────────────────────┐
+│  PostgreSQL    │    │  Celery Worker  (worker/)                │
+│  jobs          │◄───│                                          │
+│  tasks         │    │  plan_job task                           │
+│  users         │    │  ├─ [M7] Qdrant memory search           │
+│  workspaces    │    │  ├─ MockPlanner / OpenAIPlanner          │
+└────────────────┘    │  └─ persist TaskModel rows              │
+                      │                                          │
+         ┌────────────│  execute_step task                       │
+         │  Redis     │  ├─ atomic claim guard                   │
+         │  broker    │  ├─ tool registry dispatch               │
+         │  results   │  │   ├─ web_search (DuckDuckGo)         │
+         └────────────│  │   ├─ code_exec (subprocess/Docker)   │
+                      │  │   └─ synthesis (LLM summarise)       │
+                      │  └─ [M7] store tool_output / job_result │
+                      └──────────────────────────────────────────┘
+                                          │
+                             ┌────────────┴────────────┐
+                             │                         │
+                    ┌────────▼───────┐       ┌────────▼────────┐
+                    │  Prometheus    │       │  Qdrant         │
+                    │  :9090 scrape  │       │  vector memory  │
+                    └────────┬───────┘       │  (optional)     │
+                             │               └─────────────────┘
+                    ┌────────▼───────┐
+                    │  Grafana       │
+                    │  dashboards    │
+                    └────────────────┘
 ```
 
-The job will transition: `pending → planning → planned → running`
-Each task row will appear with `status: queued` then `status: succeeded` (stub executor).
+| Component | Technology | Role |
+|-----------|-----------|------|
+| API Server | FastAPI + asyncpg | Accept requests, persist jobs, enqueue work |
+| Task Queue | Celery + Redis | Async task dispatch and routing |
+| Planner | Celery + OpenAI SDK | LLM → structured ExecutionPlan (MockPlanner fallback) |
+| Executor | Celery | Run task steps via tool registry |
+| Tool: web_search | DuckDuckGo HTTP | Retrieve web results |
+| Tool: code_exec | Subprocess / Docker | Execute Python safely with resource limits |
+| State Store | PostgreSQL | Jobs, tasks, tool I/O, audit trail |
+| Auth | JWT (HS256) + bcrypt | User/Workspace models, workspace-scoped isolation |
+| Memory | Qdrant + embeddings | Semantic retrieval of past results (optional) |
+| Metrics | prometheus_client | Counters + histograms for tasks, tools, HTTP |
+| Dashboards | Grafana + Prometheus | Pre-configured agent-platform dashboard |
 
-### Run with a real LLM
+---
+
+## Authentication
+
+Every `/jobs` endpoint requires a Bearer JWT.
+
+```
+POST /auth/register  →  creates User + Workspace, returns user info
+POST /auth/token     →  email + password → JWT (HS256, configurable TTL)
+GET  /auth/me        →  current user (token required)
+```
+
+Token claims: `sub=user_id`. On each request the API resolves the user's workspace and scopes every DB query by `workspace_id`. A request for a job in another workspace returns **404** — indistinguishable from a missing resource (no information leakage).
+
+```bash
+# 1. Register (creates a workspace automatically)
+curl -s -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "dev@example.com", "password": "devpassword"}' | jq .
+
+# 2. Get a token
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/token \
+  -d "username=dev@example.com&password=devpassword" | jq -r .access_token)
+
+# 3. All job requests use the token
+curl -s http://localhost:8000/auth/me \
+  -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+Swagger UI: click **Authorize** at http://localhost:8000/docs and enter `Bearer <token>`.
+
+---
+
+## End-to-End Demo
+
+### 1. Register and get a token
+
+```bash
+curl -s -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "dev@example.com", "password": "devpassword"}' | jq .
+
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/token \
+  -d "username=dev@example.com&password=devpassword" | jq -r .access_token)
+```
+
+### 2. Submit a job
+
+```bash
+JOB=$(curl -s -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"prompt": "Research the latest advances in transformer architectures and summarise the key findings"}' \
+  | jq -r .id)
+echo "Job ID: $JOB"
+```
+
+### 3. Watch it execute
+
+```bash
+watch -n 2 "curl -s -H 'Authorization: Bearer $TOKEN' http://localhost:8000/jobs/$JOB \
+  | jq '{status, result}'"
+```
+
+Typical progression (MockPlanner — no API key required):
+
+```
+pending → planning → planned → running
+  task web_search:   queued → running → succeeded
+  task analyse:      queued → running → succeeded
+  task synthesise:   queued → running → succeeded
+→ succeeded
+```
+
+### 4. Inspect a task's tool output
+
+```bash
+TASK_ID=$(curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/jobs/$JOB \
+  | jq -r '.tasks[] | select(.tool_name=="web_search") | .id')
+
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8000/jobs/$JOB/tasks/$TASK_ID \
+  | jq '{step_id, status, tool_name, tool_input, tool_output, attempt_count, started_at, finished_at}'
+```
+
+### 5. Cancel a running job
+
+```bash
+NEW_JOB=$(curl -s -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"prompt": "A long-running task"}' | jq -r .id)
+
+curl -s -X POST http://localhost:8000/jobs/$NEW_JOB/cancel \
+  -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+### 6. View metrics in Grafana
+
+Open http://localhost:3000 → **Agent Platform** dashboard.
+
+Key panels: Tasks Succeeded/Failed · Task Execution Rate · Tool Duration p50/p95 · Queue-Wait Delay p95 · HTTP Request Duration p95.
+
+---
+
+## Memory Layer
+
+Optional Qdrant-backed semantic memory, disabled by default.
+
+```
+Job succeeds         → store job_result  → Qdrant (scoped by workspace_id)
+Task tool_call ends  → store tool_output → Qdrant
+
+Planning:   search(workspace_id, job.prompt, top_k=3)       → inject job_result context into LLM prompt
+Synthesis:  search(workspace_id, task.description, top_k=3) → inject into synthesis output
+```
+
+When `MEMORY_ENABLED=false` (default), all calls go to `NullMemoryStore` — pure no-op, zero Qdrant dependency.
+
+### What gets stored
+
+| Entry type | When | Content |
+|-----------|------|---------|
+| `tool_output` | After any `tool_call` task succeeds | `Tool: <name>\nTask: <name>\nOutput: <truncated>` |
+| `job_result` | After job transitions to `succeeded` | `Prompt: <prompt>\nResult: <result>` |
+
+### Enabling memory
 
 ```bash
 # In .env:
-OPENAI_API_KEY=sk-your-key
-OPENAI_MODEL=gpt-4o-mini          # or gpt-4o, or any OpenAI-compatible model
-OPENAI_BASE_URL=https://api.openai.com/v1
+MEMORY_ENABLED=true
+QDRANT_URL=http://qdrant:6333
+# Optional — leave as sk-not-set for the deterministic mock embedder (no API cost):
+OPENAI_API_KEY=sk-not-set
 ```
 
-The OpenAIPlanner uses `response_format: json_object` to guarantee valid JSON output,
-then validates the response with Pydantic before persisting any rows.
+Workspace isolation: every stored entry carries `workspace_id` in the Qdrant payload. Every search applies a server-side `must` filter — a tenant can never read another tenant's entries.
 
-To use a local model (Ollama, vLLM, etc.), point `OPENAI_BASE_URL` at your endpoint
-and set `OPENAI_MODEL` to the model name — no other changes required.
+---
+
+## API Reference
+
+### Auth (no token required)
+
+```
+POST   /auth/register    Create user + workspace → { id, email, created_at }
+POST   /auth/token       email+password → { access_token, token_type }
+GET    /auth/me          Current user info (token required)
+```
+
+### Jobs (Bearer token required — workspace-scoped)
+
+```
+POST   /jobs                         Submit a new job
+GET    /jobs                         List 50 most recent jobs (this workspace)
+GET    /jobs/{id}                    Job detail + all tasks
+POST   /jobs/{id}/cancel             Cancel a running job
+GET    /jobs/{id}/tasks/{task_id}    Full task detail (inputs, outputs, timestamps)
+```
+
+### System
+
+```
+GET    /health    Liveness probe
+GET    /ready     Readiness probe (checks DB connection)
+GET    /metrics   Prometheus scrape endpoint
+```
+
+### Status transitions
+
+```
+Job:   pending → planning → planned → running → succeeded / failed / cancelled
+Task:  pending → queued   → running → succeeded / failed / skipped
+```
+
+A cancelled job causes all in-flight and pending tasks to be skipped via the executor's pre-flight check.
+
+---
+
+## Observability
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `agent_jobs_created_total` | Counter | — |
+| `agent_jobs_cancelled_total` | Counter | — |
+| `agent_job_plans_total` | Counter | status |
+| `agent_task_executions_total` | Counter | task_type, status |
+| `agent_task_duration_seconds` | Histogram | task_type |
+| `agent_task_queue_delay_seconds` | Histogram | — |
+| `agent_task_retries_total` | Counter | task_type |
+| `agent_tool_calls_total` | Counter | tool_name, status |
+| `agent_tool_duration_seconds` | Histogram | tool_name |
+| `agent_http_request_duration_seconds` | Histogram | method, path |
+
+**Single-process note:** The worker runs `--concurrency=1` so all metrics are captured in one process and visible at `:9090`. For higher concurrency in production, set `PROMETHEUS_MULTIPROC_DIR` (prometheus_client multiprocess mode) and increase concurrency.
+
+---
+
+## Sandbox Execution
+
+`code_exec` runs user-supplied Python through a pluggable sandbox backend.
+
+| Backend | Isolation | Use case |
+|---------|-----------|---------|
+| `subprocess` (default) | Timeout only | Dev / CI |
+| `docker` | CPU + memory + network + read-only fs | Production |
+
+```bash
+# .env
+SANDBOX_BACKEND=docker
+SANDBOX_IMAGE=python:3.11-slim
+SANDBOX_TIMEOUT_SECONDS=30
+```
+
+Docker safety boundaries: network disabled, 128 MiB memory limit, 50% CPU quota, read-only workspace volume, container force-removed after every run.
+
+---
+
+## Execution Hardening
+
+| Guard | Mechanism |
+|-------|-----------|
+| Duplicate execution | `UPDATE tasks SET status='running' WHERE id=? AND status IN ('pending','queued')` — rowcount=0 → skip |
+| Duplicate enqueue | Same atomic UPDATE `pending` → `queued` before `send_task()` |
+| Terminal task guard | Pre-check: task already in succeeded/failed/skipped → return immediately |
+| Terminal job guard | `_check_job_completion` never overwrites a terminal status |
+| Audit trail | `attempt_count`, `started_at`, `finished_at` on every task row |
 
 ---
 
 ## Running Tests
 
-Tests are pure unit tests — no running Docker needed.
-
 ```bash
-# Install dev dependencies
 pip install -r requirements-dev.txt
-
-# Set PYTHONPATH so shared/ and worker/ are importable
 export PYTHONPATH=$(pwd)
-
-# Run all tests
-pytest
-
-# Run a specific file
-pytest tests/test_mock_planner.py -v
+pytest                              # all 186 tests (no running Docker required)
+pytest tests/test_memory.py -v      # memory layer: store, search, embeddings, isolation
+pytest tests/test_auth.py -v        # JWT auth + workspace isolation
+pytest tests/test_api.py -v         # API endpoint tests
+pytest tests/test_metrics.py -v     # Prometheus metrics
+pytest tests/test_executor.py -v    # executor + hardening
+pytest tests/test_sandbox.py -v     # sandbox abstraction
 ```
-
----
-
-## Job & Task Status Lifecycle
-
-```
-Job:   pending → planning → planned → running → succeeded / failed
-Task:  pending → queued   → running → succeeded / failed
-```
-
-- `planned` — ExecutionPlan persisted to DB; executor dispatch imminent
-- `queued` — TaskModel row exists and the Celery message has been sent
-- `succeeded` — terminal success (distinct from failed for monitoring clarity)
 
 ---
 
@@ -112,21 +336,35 @@ Task:  pending → queued   → running → succeeded / failed
 
 ```
 .
-├── api/                    # FastAPI service
+├── api/
+│   ├── auth/               # JWT utils, FastAPI dependencies (get_current_workspace)
 │   ├── db/                 # SQLAlchemy ORM models + async session
-│   ├── routers/            # Route handlers
-│   └── schemas/            # Pydantic request/response shapes
-├── worker/                 # Celery worker service
-│   ├── planner/            # BasePlanner, MockPlanner, OpenAIPlanner, factory
+│   ├── routers/
+│   │   ├── auth.py         # POST /auth/register, /auth/token, GET /auth/me
+│   │   └── jobs.py         # POST /jobs, GET /jobs, cancel, task detail (workspace-scoped)
+│   ├── schemas/
+│   │   ├── auth.py         # UserCreate, UserResponse, TokenResponse
+│   │   └── job.py          # CreateJobRequest, JobResponse, TaskResponse
+│   ├── metrics.py          # API Prometheus metrics
+│   └── main.py             # App setup, /health, /ready, /metrics
+├── worker/
+│   ├── memory/             # Qdrant-backed memory layer (NullMemoryStore when disabled)
+│   ├── planner/            # BasePlanner, MockPlanner, OpenAIPlanner
+│   ├── sandbox/            # BaseSandbox, DockerSandbox, SubprocessSandbox
 │   ├── tasks/              # plan_job and execute_step Celery tasks
-│   ├── tools/              # Tool registry + stubs (web_search, code_exec)
-│   └── db/                 # Sync SQLAlchemy for Celery tasks
-├── shared/                 # Domain models + constants (used by both services)
-├── tests/                  # Unit tests (no Docker required)
+│   ├── tools/              # web_search, code_exec, registry
+│   ├── db/                 # Sync SQLAlchemy for Celery tasks
+│   ├── metrics.py          # Worker Prometheus metrics
+│   └── celery_app.py       # Celery config + metrics server startup
+├── shared/                 # Domain models + constants
+├── tests/                  # 186 unit tests (no running Docker required)
 ├── infra/
-│   ├── init.sql            # Postgres schema bootstrap (fresh install)
-│   └── migrate_m2.sql      # Incremental migration (existing M1 DB)
-├── requirements-dev.txt    # Test/dev dependencies
+│   ├── init.sql            # PostgreSQL schema (fresh install)
+│   ├── migrate_m4.sql      # M3 → M4 migration (execution audit fields)
+│   ├── migrate_m6.sql      # M5 → M6 migration (users, workspaces, workspace_id)
+│   ├── prometheus.yml      # Prometheus scrape config
+│   └── grafana/            # Grafana provisioning (datasource + dashboard)
+├── requirements-dev.txt
 └── docker-compose.yml
 ```
 
@@ -134,35 +372,29 @@ Task:  pending → queued   → running → succeeded / failed
 
 ## Design Decisions
 
-**Why MockPlanner instead of a hardcoded stub?**
-The mock implements the same `BasePlanner` interface as `OpenAIPlanner`. This means
-all downstream code (persistence, enqueue logic, tests) exercises the real path.
-Switching from mock to real LLM is a single config change.
+**Why MockPlanner?** Same interface as OpenAIPlanner — all downstream code exercises the real path. Switching to a live LLM is a single env-var change.
 
-**Why `json_object` mode instead of OpenAI Structured Outputs?**
-`json_object` mode is available on all current OpenAI models. Structured Outputs
-(JSON Schema mode) is only available on `gpt-4o-2024-08-06+` and requires registering
-a schema. We get the same guarantee (valid JSON) + Pydantic validation, with broader
-model compatibility.
+**Why `json_object` mode over OpenAI Structured Outputs?** Available on all current OpenAI models; broader compatibility than JSON Schema mode.
 
-**Why keep `step_id` as a string rather than using the DB UUID?**
-The LLM assigns `step_id` values like `"search_papers"` before rows exist in DB.
-Dependencies reference these string keys at plan time. After persistence, executor
-chain dispatch uses the DB UUID for task lookup. Both identifiers serve different
-phases of the pipeline.
+**Why `step_id` as a string?** LLM assigns step IDs before DB rows exist. Dependencies use string keys at plan time; executor uses DB UUIDs for task lookup.
 
-**Why two separate ORM model files (api/db and worker/db)?**
-The API uses `asyncpg` (async driver) and the worker uses `psycopg2` (sync, required
-by Celery). Keeping them separate avoids import coupling. `infra/init.sql` is the
-single source of truth for schema.
+**Why two ORM files?** API uses asyncpg; worker uses psycopg2. `infra/init.sql` is the single schema source of truth.
 
-**Why `task_acks_late=True`?**
-Tasks are acknowledged after completion, not on receipt. If a worker crashes
-mid-execution, the task re-queues. Combined with idempotent task design, this gives
-at-least-once delivery semantics — appropriate for agentic workloads.
+**Why `task_acks_late=True`?** At-least-once delivery — tasks re-queue on worker crash. The atomic claim guard makes re-delivery safe.
 
-**Migrating an existing M1 database:**
+**Why `--concurrency=1` in docker-compose?** Keeps all metrics in one process for the demo setup. Increase + set `PROMETHEUS_MULTIPROC_DIR` for production scale.
+
+---
+
+## Migrating an Existing Database
+
 ```bash
-docker compose exec postgres psql -U agent -d agentdb < infra/migrate_m2.sql
+# M3 → M4 (attempt_count, started_at, finished_at)
+docker compose exec postgres psql -U agent -d agentdb < infra/migrate_m4.sql
+
+# M5 → M6 (users, workspaces, workspace_id on jobs)
+docker compose exec postgres psql -U agent -d agentdb < infra/migrate_m6.sql
+
+# Clean reset (drops all data):
+docker compose down -v && docker compose up --build
 ```
-For a clean reset: `docker compose down -v && docker compose up --build`

@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(python -m pytest tests/test_executor.py -v)",
-      "Bash(python -m pytest -v)"
+      "Bash(python -m pytest -v)",
+      "Bash(pip install:*)",
+      "Bash(PYTHONPATH=$\\(pwd\\) python -m pytest tests/test_auth.py tests/test_api.py -v --tb=short)",
+      "Bash(PYTHONPATH=$\\(pwd\\) python -m pytest tests/test_memory.py -v --tb=short)",
+      "Bash(PYTHONPATH=$\\(pwd\\) python -m pytest tests/ -v --tb=short)",
+      "Bash(PYTHONPATH=$\\(pwd\\) python -m pytest tests/ --tb=short -q)"
     ]
   }
 }

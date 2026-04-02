@@ -6,6 +6,9 @@ Flow:
           → PLANNED   (ExecutionPlan persisted as TaskModel rows)
           → RUNNING   (ready tasks enqueued to executor)
           → FAILED    (any unhandled error)
+
+M7: if MEMORY_ENABLED=true, relevant past results are retrieved from the
+    memory store and injected into the planning prompt before the LLM call.
 """
 
 from __future__ import annotations
@@ -15,12 +18,14 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+import worker.metrics as metrics
+from shared.constants import QUEUE_EXECUTOR, TASK_EXECUTE_STEP
 from shared.models import ExecutionPlan, PlannedStep
 from worker.celery_app import app
 from worker.db import get_sync_session
 from worker.db.models import JobModel, TaskModel
+from worker.memory import get_memory_store
 from worker.planner import PlannerError, get_planner
-from shared.constants import QUEUE_EXECUTOR, TASK_EXECUTE_STEP
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +38,10 @@ logger = logging.getLogger(__name__)
 def plan_job(self, job_id: str) -> dict:
     """
     1. Load job, transition PENDING → PLANNING
-    2. Call planner (mock or OpenAI)
-    3. Persist TaskModel rows, transition → PLANNED
-    4. Enqueue dependency-free tasks, transition → RUNNING
+    2. Optionally retrieve relevant memories for planning context
+    3. Call planner (mock or OpenAI)
+    4. Persist TaskModel rows, transition → PLANNED
+    5. Enqueue dependency-free tasks, transition → RUNNING
     """
     logger.info("Planning job %s", job_id)
     jid = uuid.UUID(job_id)
@@ -46,13 +52,20 @@ def plan_job(self, job_id: str) -> dict:
             return {"error": "job not found"}
 
         _set_job_status(session, job, "planning")
+        workspace_id = str(job.workspace_id) if job.workspace_id else None
+        prompt = job.prompt
+
+    # Retrieve memory context outside the DB session to avoid holding a
+    # connection during potentially slow Qdrant + LLM calls.
+    context = _get_memory_context(workspace_id, prompt)
 
     # Run planning outside the DB session — LLM call can be slow
     try:
         planner = get_planner()
-        plan = planner.plan(jid, job.prompt)
+        plan = planner.plan(jid, prompt, context=context)
     except PlannerError as exc:
         logger.error("Planning failed for job %s: %s", job_id, exc)
+        metrics.job_plans_total.labels(status="failed").inc()
         with get_sync_session() as session:
             job = _load_job(session, jid)
             if job:
@@ -84,6 +97,7 @@ def plan_job(self, job_id: str) -> dict:
 
         _set_job_status(session, job, "running")
 
+    metrics.job_plans_total.labels(status="succeeded").inc()
     logger.info(
         "Job %s: plan has %d steps, %d enqueued immediately",
         job_id, len(plan.steps), len(enqueued_ids),
@@ -93,6 +107,30 @@ def plan_job(self, job_id: str) -> dict:
         "total_steps": len(plan.steps),
         "enqueued": enqueued_ids,
     }
+
+
+# ---------------------------------------------------------------------------
+# Memory context retrieval (M7)
+# ---------------------------------------------------------------------------
+
+def _get_memory_context(workspace_id: str | None, prompt: str) -> list[str]:
+    """
+    Retrieve the top-3 semantically similar past job results from memory.
+
+    Returns an empty list when:
+    - memory is disabled (NullMemoryStore returns [])
+    - no workspace is set
+    - the memory store raises any exception (we never let memory block planning)
+    """
+    if not workspace_id:
+        return []
+    try:
+        store = get_memory_store()
+        entries = store.search(workspace_id, query=prompt, top_k=3)
+        return [e.content for e in entries if e.entry_type == "job_result"]
+    except Exception:
+        logger.warning("Failed to retrieve memory context for planning", exc_info=True)
+        return []
 
 
 # ---------------------------------------------------------------------------

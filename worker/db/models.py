@@ -18,9 +18,10 @@ class Base(DeclarativeBase):
 class JobModel(Base):
     __tablename__ = "jobs"
 
-    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    prompt     = Column(Text, nullable=False)
-    status     = Column(
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), nullable=True)  # set by API; worker reads but never writes
+    prompt       = Column(Text, nullable=False)
+    status       = Column(
         Enum(
             "pending", "planning", "planned", "running", "succeeded", "failed", "cancelled",
             name="job_status",
@@ -65,6 +66,9 @@ class TaskModel(Base):
     error           = Column(Text)
     sequence        = Column(Integer, nullable=False, default=0)
     expected_output = Column(Text)
+    attempt_count   = Column(Integer, nullable=False, default=0)
+    started_at      = Column(DateTime(timezone=True), nullable=True)
+    finished_at     = Column(DateTime(timezone=True), nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

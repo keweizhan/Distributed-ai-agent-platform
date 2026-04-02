@@ -40,8 +40,13 @@ class OpenAIPlanner(BasePlanner):
         )
         self._model = settings.openai_model
 
-    def plan(self, job_id: uuid.UUID, prompt: str) -> ExecutionPlan:
-        user_msg = build_user_prompt(prompt)
+    def plan(
+        self,
+        job_id: uuid.UUID,
+        prompt: str,
+        context: list[str] | None = None,
+    ) -> ExecutionPlan:
+        user_msg = build_user_prompt(prompt, context=context)
 
         logger.info("Calling LLM planner (model=%s, job=%s)", self._model, job_id)
 

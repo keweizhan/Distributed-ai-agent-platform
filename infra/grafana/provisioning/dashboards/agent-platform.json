@@ -1,0 +1,137 @@
+{
+  "title": "Agent Platform",
+  "uid": "agent-platform",
+  "schemaVersion": 38,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Jobs Created (total)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "agent_jobs_created_total",
+        "legendFormat": "created"
+      }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Jobs Cancelled (total)",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "agent_jobs_cancelled_total",
+        "legendFormat": "cancelled"
+      }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Tasks Succeeded (total)",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "sum(agent_task_executions_total{status='succeeded'})",
+        "legendFormat": "succeeded"
+      }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Tasks Failed (total)",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "sum(agent_task_executions_total{status='failed'})",
+        "legendFormat": "failed"
+      }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "thresholds": {
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ]
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Task Execution Rate (by status)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(agent_task_executions_total[2m])",
+          "legendFormat": "{{task_type}} / {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Tool Call Rate (by tool)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(agent_tool_calls_total[2m])",
+          "legendFormat": "{{tool_name}} / {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Task Duration p50 / p95 (seconds)",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(agent_task_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50 {{task_type}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(agent_task_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95 {{task_type}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Tool Duration p50 / p95 (seconds)",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(agent_tool_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50 {{tool_name}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(agent_tool_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95 {{tool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Queue-Wait Delay p95 (task created → claimed)",
+      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(agent_task_queue_delay_seconds_bucket[5m]))",
+        "legendFormat": "p95 queue delay"
+      }]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "HTTP Request Duration p95",
+      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(agent_http_request_duration_seconds_bucket[5m]))",
+        "legendFormat": "p95 {{method}} {{path}}"
+      }]
+    }
+  ]
+}

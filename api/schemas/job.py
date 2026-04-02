@@ -14,13 +14,14 @@ class CreateJobRequest(BaseModel):
 
 
 class JobResponse(BaseModel):
-    id:         uuid.UUID
-    prompt:     str
-    status:     JobStatus
-    result:     str | None = None
-    error:      str | None = None
-    created_at: datetime
-    updated_at: datetime
+    id:           uuid.UUID
+    workspace_id: uuid.UUID | None = None
+    prompt:       str
+    status:       JobStatus
+    result:       str | None = None
+    error:        str | None = None
+    created_at:   datetime
+    updated_at:   datetime
 
     model_config = {"from_attributes": True}
 
@@ -41,6 +42,9 @@ class TaskResponse(BaseModel):
     error:           str | None = None
     sequence:        int
     expected_output: str | None = None
+    attempt_count:   int = 0
+    started_at:      datetime | None = None
+    finished_at:     datetime | None = None
 
     model_config = {"from_attributes": True}
 

@@ -1,5 +1,5 @@
 """
-Unit tests for the executor task — Milestones 3A and 3B.
+Unit tests for the executor task — Milestones 3A, 3B, and 4.
 
 All DB calls are mocked; no live Postgres or Celery required.
 
@@ -19,6 +19,10 @@ Test organisation
      8d. Upstream failure blocks downstream
 9.  Pre-flight skip (task arrives after job already failed)
 10. Tool unit tests (web_search, code_exec)
+11. Execution hardening (M4)
+     11a. Duplicate execution prevention (claim guard)
+     11b. attempt_count / started_at / finished_at tracking
+     11c. Terminal task guard (at-least-once redelivery)
 """
 
 from __future__ import annotations
@@ -57,6 +61,9 @@ def _make_task(
     t.error = None
     t.tool_output = None
     t.dependencies = dependencies or []
+    t.attempt_count = 0
+    t.started_at = None
+    t.finished_at = None
     return t
 
 
@@ -76,12 +83,14 @@ def _make_job(
 def _session_for(
     *tasks: MagicMock,
     job: MagicMock | None = None,
+    claim_rowcount: int = 1,
 ) -> MagicMock:
     """
     Build a mock session where:
       - session.get(TaskModel, task.id) → that task
       - session.get(JobModel, any_key)  → job (if provided)
       - session.query(...).filter(...).all() → list(tasks)
+      - session.execute(...).rowcount → claim_rowcount (default 1 = claim succeeds)
     """
     task_map = {t.id: t for t in tasks}
     _job = job or (tasks[0] and _make_job(job_id=tasks[0].job_id))
@@ -94,6 +103,7 @@ def _session_for(
     session = MagicMock()
     session.get.side_effect = _get
     session.query.return_value.filter.return_value.all.return_value = list(tasks)
+    session.execute.return_value.rowcount = claim_rowcount
     return session
 
 
@@ -1050,3 +1060,152 @@ class TestCodeExecTool:
         from worker.tools.code_exec import code_exec
         with pytest.raises(ToolError, match="timed out"):
             code_exec(code="import time; time.sleep(60)", timeout=1)
+
+    def test_successful_result_includes_duration(self) -> None:
+        from worker.tools.code_exec import code_exec
+        result = code_exec(code='print("hi")')
+        assert "duration_seconds" in result
+        assert result["duration_seconds"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# 11. Execution hardening (M4)
+# ---------------------------------------------------------------------------
+
+class TestDuplicateExecutionPrevention:
+    """Claim guard: only one worker may execute a given task_id."""
+
+    def test_claim_succeeds_when_rowcount_is_one(self) -> None:
+        """Normal path: claim returns True, task proceeds to running."""
+        task = _make_task(status="queued")
+        job = _make_job(job_id=task.job_id)
+        # rowcount=1 → claim succeeds (default)
+        session = _session_for(task, job=job, claim_rowcount=1)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+            mock_get_tool.return_value = lambda **kw: {}
+
+            from worker.tasks.executor import execute_step
+            result = execute_step(str(task.id))
+
+        assert result["status"] == "succeeded"
+        assert task.status == "succeeded"
+
+    def test_claim_fails_when_rowcount_is_zero(self) -> None:
+        """Another worker already claimed this task — execute_step must exit early."""
+        task = _make_task(status="queued")
+        job = _make_job(job_id=task.job_id)
+        # rowcount=0 → claim fails, task already claimed by another worker
+        session = _session_for(task, job=job, claim_rowcount=0)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+
+            from worker.tasks.executor import execute_step
+            result = execute_step(str(task.id))
+
+        mock_get_tool.assert_not_called()
+        assert result["status"] == "skipped"
+
+    def test_claim_sets_started_at(self) -> None:
+        """_claim_task must write started_at onto the task object."""
+        task = _make_task(status="queued")
+        job = _make_job(job_id=task.job_id)
+        session = _session_for(task, job=job, claim_rowcount=1)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+            mock_get_tool.return_value = lambda **kw: {}
+
+            from worker.tasks.executor import execute_step
+            execute_step(str(task.id))
+
+        assert task.started_at is not None
+
+    def test_claim_increments_attempt_count(self) -> None:
+        task = _make_task(status="queued")
+        task.attempt_count = 0
+        job = _make_job(job_id=task.job_id)
+        session = _session_for(task, job=job, claim_rowcount=1)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+            mock_get_tool.return_value = lambda **kw: {}
+
+            from worker.tasks.executor import execute_step
+            execute_step(str(task.id))
+
+        assert task.attempt_count == 1
+
+
+class TestTimestampTracking:
+    """finished_at is set on both success and failure paths."""
+
+    def test_finished_at_set_on_success(self) -> None:
+        task = _make_task(status="queued")
+        job = _make_job(job_id=task.job_id)
+        session = _session_for(task, job=job, claim_rowcount=1)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+            mock_get_tool.return_value = lambda **kw: {}
+
+            from worker.tasks.executor import execute_step
+            execute_step(str(task.id))
+
+        assert task.finished_at is not None
+
+    def test_finished_at_set_on_failure(self) -> None:
+        task = _make_task(status="queued")
+        job = _make_job(job_id=task.job_id)
+        session = _session_for(task, job=job, claim_rowcount=1)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+            mock_get_tool.return_value = MagicMock(side_effect=ToolError("boom"))
+
+            from worker.tasks.executor import execute_step
+            execute_step(str(task.id))
+
+        assert task.finished_at is not None
+
+
+class TestTerminalTaskGuard:
+    """Tasks in terminal states must not be re-executed (at-least-once redelivery)."""
+
+    @pytest.mark.parametrize("terminal_status", ["succeeded", "failed", "skipped"])
+    def test_already_terminal_task_skips_without_tool_call(self, terminal_status: str) -> None:
+        task = _make_task(status=terminal_status)
+        job = _make_job(job_id=task.job_id)
+        session = _session_for(task, job=job)
+
+        with (
+            patch("worker.tasks.executor.get_sync_session") as mock_ctx,
+            patch("worker.tasks.executor.get_tool") as mock_get_tool,
+        ):
+            mock_ctx.return_value.__enter__.return_value = session
+
+            from worker.tasks.executor import execute_step
+            result = execute_step(str(task.id))
+
+        mock_get_tool.assert_not_called()
+        assert result["status"] == terminal_status

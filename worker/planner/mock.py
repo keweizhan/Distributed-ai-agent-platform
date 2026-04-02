@@ -20,7 +20,13 @@ from worker.planner.base import BasePlanner
 
 
 class MockPlanner(BasePlanner):
-    def plan(self, job_id: uuid.UUID, prompt: str) -> ExecutionPlan:
+    def plan(
+        self,
+        job_id: uuid.UUID,
+        prompt: str,
+        context: list[str] | None = None,
+    ) -> ExecutionPlan:
+        # context is intentionally ignored — mock always returns the same shape.
         steps = [
             PlannedStep(
                 step_id="web_search",

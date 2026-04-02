@@ -5,7 +5,7 @@ infra/init.sql is the single source of truth for the DB schema.
 
 import uuid
 
-from sqlalchemy import JSON, Column, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -14,12 +14,45 @@ class Base(DeclarativeBase):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Auth / multi-tenancy
+# ---------------------------------------------------------------------------
+
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email           = Column(String(255), nullable=False, unique=True)
+    hashed_password = Column(Text, nullable=False)
+    is_active       = Column(Boolean, nullable=False, default=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    workspaces = relationship("WorkspaceModel", back_populates="owner")
+
+
+class WorkspaceModel(Base):
+    __tablename__ = "workspaces"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name       = Column(String(255), nullable=False)
+    owner_id   = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    owner = relationship("UserModel", back_populates="workspaces")
+    jobs  = relationship("JobModel", back_populates="workspace")
+
+
+# ---------------------------------------------------------------------------
+# Jobs / tasks
+# ---------------------------------------------------------------------------
+
 class JobModel(Base):
     __tablename__ = "jobs"
 
-    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    prompt     = Column(Text, nullable=False)
-    status     = Column(
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=True)
+    prompt       = Column(Text, nullable=False)
+    status       = Column(
         Enum(
             "pending", "planning", "planned", "running", "succeeded", "failed", "cancelled",
             name="job_status",
@@ -32,7 +65,8 @@ class JobModel(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    tasks = relationship("TaskModel", back_populates="job", cascade="all, delete-orphan")
+    workspace = relationship("WorkspaceModel", back_populates="jobs")
+    tasks     = relationship("TaskModel", back_populates="job", cascade="all, delete-orphan")
 
 
 class TaskModel(Base):
@@ -64,6 +98,9 @@ class TaskModel(Base):
     error           = Column(Text)
     sequence        = Column(Integer, nullable=False, default=0)
     expected_output = Column(Text)
+    attempt_count   = Column(Integer, nullable=False, default=0)
+    started_at      = Column(DateTime(timezone=True), nullable=True)
+    finished_at     = Column(DateTime(timezone=True), nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

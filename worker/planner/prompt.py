@@ -50,15 +50,26 @@ that aggregates prior results into a final answer.
 """
 
 
-def build_user_prompt(prompt: str) -> str:
-    """Build the user-turn message sent to the LLM."""
+def build_user_prompt(prompt: str, context: list[str] | None = None) -> str:
+    """
+    Build the user-turn message sent to the LLM.
+
+    If *context* is provided (retrieved from memory), it is injected before
+    the user request so the LLM can reuse prior findings and avoid redundant
+    work on similar tasks.
+    """
     tools = list_tools()
     tool_list = "\n".join(f"  - {t}" for t in tools) if tools else "  (none registered yet)"
+
+    context_section = ""
+    if context:
+        snippets = "\n".join(f"  [{i+1}] {c}" for i, c in enumerate(context))
+        context_section = f"\nRELEVANT PAST RESULTS (from memory — use as context, do not repeat verbatim):\n{snippets}\n"
 
     return f"""\
 AVAILABLE TOOLS:
 {tool_list}
-
+{context_section}
 USER REQUEST:
 {prompt}
 
