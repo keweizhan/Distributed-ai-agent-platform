@@ -12,5 +12,5 @@ WORKDIR /app
 COPY worker/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker/ ./
+COPY worker/ ./worker/
 COPY shared/ ./shared/

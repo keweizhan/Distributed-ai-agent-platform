@@ -12,7 +12,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agent}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agent} -d ${POSTGRES_DB:-agentdb}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -30,8 +30,8 @@ services:
 
   api:
     build:
-      context: ./api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: api/Dockerfile
     restart: unless-stopped
     env_file: .env
     ports:
@@ -42,10 +42,11 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./api:/app
+      - ./api:/app/api
       - ./shared:/app/shared
     environment:
       - PYTHONPATH=/app
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 10s
@@ -54,8 +55,8 @@ services:
 
   worker:
     build:
-      context: ./worker
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: worker/Dockerfile
     restart: unless-stopped
     env_file: .env
     depends_on:
@@ -66,7 +67,7 @@ services:
     ports:
       - "9090:9090"    # Prometheus metrics scrape port
     volumes:
-      - ./worker:/app
+      - ./worker:/app/worker
       - ./shared:/app/shared
       - /var/run/docker.sock:/var/run/docker.sock  # for code sandbox
     environment:
@@ -74,7 +75,7 @@ services:
     # --concurrency=1 keeps all task execution in one process so Prometheus
     # metrics from child workers are fully visible at :9090.
     # In production, set PROMETHEUS_MULTIPROC_DIR and increase concurrency.
-    command: celery -A celery_app worker --loglevel=info --concurrency=1
+    command: celery -A worker.celery_app worker --loglevel=info --concurrency=1 -Q celery,planner,executor
 
   prometheus:
     image: prom/prometheus:v2.51.0

@@ -172,7 +172,7 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
         tool_name = task.tool_name or "synthesis"
         tool_start = time.monotonic()
         try:
-            output = _invoke_tool(task, memory_context=memory_context)
+            output = _invoke_tool(task, memory_context=memory_context, session=session)
         except ToolError as exc:
             metrics.tool_calls_total.labels(tool_name=tool_name, status="failed").inc()
             metrics.task_executions_total.labels(
@@ -311,16 +311,48 @@ def _enqueue_ready_task(session: Session, task: TaskModel) -> bool:
 def _invoke_tool(
     task: TaskModel,
     memory_context: list[str] | None = None,
+    session: Session | None = None,
 ) -> dict[str, Any]:
     """
     Resolve and call the registered tool for this task.
 
-    Synthesis steps do not call an external tool; they aggregate prior outputs.
-    If *memory_context* is provided (from the memory store), it is included in
-    the synthesis output for visibility.
+    Synthesis steps aggregate the tool_output of every completed sibling
+    tool_call task in the same job.  If *memory_context* is provided it is
+    appended for downstream visibility.
     """
     if task.task_type == "synthesis":
-        result: dict[str, Any] = {"note": "synthesis step — aggregation not yet implemented"}
+        collected: list[dict[str, Any]] = []
+        if session is not None:
+            siblings = (
+                session.query(TaskModel)
+                .filter(
+                    TaskModel.job_id == task.job_id,
+                    TaskModel.task_type == "tool_call",
+                    TaskModel.status == "succeeded",
+                    TaskModel.tool_output.isnot(None),
+                )
+                .order_by(TaskModel.sequence)
+                .all()
+            )
+            for s in siblings:
+                collected.append({
+                    "step_id":   s.step_id,
+                    "name":      s.name,
+                    "tool_name": s.tool_name,
+                    "output":    s.tool_output,
+                })
+
+        n = len(collected)
+        summary = (
+            f"Aggregated {n} completed step{'s' if n != 1 else ''}: "
+            + ", ".join(c["name"] or c["step_id"] or "" for c in collected)
+            if collected
+            else "No tool_call steps completed successfully."
+        )
+        result: dict[str, Any] = {
+            "note":            summary,
+            "collected_steps": collected,
+        }
         if memory_context:
             result["memory_context"] = memory_context
         return result

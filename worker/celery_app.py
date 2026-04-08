@@ -52,6 +52,8 @@ app.conf.update(
 @worker_ready.connect
 def _start_metrics_server(**_kw: object) -> None:
     from prometheus_client import start_http_server
+    from worker.tools.registry import list_tools
     port = settings.worker_metrics_port
     start_http_server(port)
     logger.info("Prometheus metrics server started on :%d", port)
+    logger.info("Registered tools at worker startup: %s", list_tools())

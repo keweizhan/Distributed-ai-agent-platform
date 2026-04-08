@@ -11,7 +11,7 @@ all DB queries so no tenant can access another tenant's data.
 import uuid
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,12 +20,15 @@ from api.auth.utils import decode_access_token
 from api.db.models import UserModel, WorkspaceModel
 from api.db.session import get_db
 
-# Points at the token endpoint so Swagger UI shows the Authorize button.
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+# HTTPBearer shows a plain "Value" token input in Swagger UI instead of the
+# OAuth2 password-flow popup.  The OAuth2 popup is unreliable when client_id
+# is blank (Swagger UI sends a malformed request and mishandles the response).
+# HTTPBearer extraction is identical at the HTTP level: Authorization: Bearer <token>.
+_bearer = HTTPBearer()
 
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ) -> UserModel:
     credentials_exc = HTTPException(
@@ -34,7 +37,7 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        user_id = decode_access_token(token)
+        user_id = decode_access_token(credentials.credentials)
     except JWTError:
         raise credentials_exc
 

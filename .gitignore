@@ -35,3 +35,6 @@ Thumbs.db
 
 # Docker build artifacts
 *.tar
+
+# Claude Code local session config (tool permissions, local state — never shared)
+.claude/

@@ -43,7 +43,7 @@ services:
     # No host port — internal network only
     networks: [internal]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agent}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agent} -d ${POSTGRES_DB:-agentdb}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -108,7 +108,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock   # required for Docker sandbox backend
     # --concurrency=2 is a safe default for a single VM.
     # Increase if CPU/RAM allows; pair with PROMETHEUS_MULTIPROC_DIR for multi-process metrics.
-    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    command: celery -A worker.celery_app worker --loglevel=info --concurrency=2 -Q celery,planner,executor
     logging: *default-logging
 
   # ─── Reverse proxy / TLS ───────────────────────────────────────────────

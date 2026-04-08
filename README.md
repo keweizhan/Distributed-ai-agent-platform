@@ -24,6 +24,58 @@ No OpenAI key required — the built-in `MockPlanner` exercises the full executi
 
 ---
 
+## Minimal Server Deploy (HTTP, no domain required)
+
+For a first Tencent Cloud / any Ubuntu VM demo without a domain name or TLS certificate.
+Open **port 8000** inbound in your cloud security group, then:
+
+```bash
+# 1. Install Docker (one-liner, Ubuntu 22.04)
+curl -fsSL https://get.docker.com | sudo bash
+sudo usermod -aG docker $USER && newgrp docker
+
+# 2. Clone and configure
+git clone <your-repo-url> ~/app && cd ~/app
+cp .env.example .env
+
+# Edit two lines in .env (minimum required for any public server):
+#   JWT_SECRET_KEY=<run: python3 -c "import secrets; print(secrets.token_hex(32))">
+#   POSTGRES_PASSWORD=<any strong password>
+# Then update DATABASE_URL to match the new POSTGRES_PASSWORD:
+#   DATABASE_URL=postgresql+asyncpg://agent:<password>@postgres:5432/agentdb
+nano .env   # or vim / sed
+
+# 3. Start only the four core services (skip prometheus/grafana/qdrant for now)
+docker compose up -d --build postgres redis api worker
+
+# 4. Validate
+curl http://<server-ip>:8000/health          # → {"status":"ok"}
+curl http://<server-ip>:8000/ready           # → {"status":"ready","db":"ok"}
+
+# 5. Register + get token + submit a job
+curl -s -X POST http://<server-ip>:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"demo@example.com","password":"demopassword"}' | jq .
+
+TOKEN=$(curl -s -X POST http://<server-ip>:8000/auth/token \
+  -d "username=demo@example.com&password=demopassword" | jq -r .access_token)
+
+JOB=$(curl -s -X POST http://<server-ip>:8000/jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"search for the latest Python release"}' | jq -r .id)
+
+# 6. Poll until succeeded
+watch -n 3 "curl -s -H 'Authorization: Bearer $TOKEN' \
+  http://<server-ip>:8000/jobs/$JOB | jq '{status,result}'"
+```
+
+Swagger UI is available at `http://<server-ip>:8000/docs`.
+
+When you have a domain name, follow [docs/deployment.md](docs/deployment.md) for the full nginx + TLS + production hardening path.
+
+---
+
 ## Architecture
 
 ```
@@ -115,7 +167,7 @@ curl -s http://localhost:8000/auth/me \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
-Swagger UI: click **Authorize** at http://localhost:8000/docs and enter `Bearer <token>`.
+Swagger UI: click **Authorize 🔒** at http://localhost:8000/docs → paste the token value into the **Value** field (no `Bearer` prefix — Swagger adds it automatically) → click **Authorize** → **Close**.
 
 ---
 
