@@ -45,6 +45,7 @@ from sqlalchemy.orm import Session
 import worker.metrics as metrics
 from shared.constants import QUEUE_EXECUTOR, TASK_EXECUTE_STEP
 from worker.celery_app import app
+from worker.config import settings
 from worker.db import get_sync_session
 from worker.db.models import JobModel, TaskModel
 from worker.memory import MemoryEntry, get_memory_store
@@ -84,43 +85,55 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
             logger.error("execute_step: task not found", extra={"task_id": task_id})
             return {"error": f"task {task_id} not found"}
 
+        # ── Extract scalar fields while the session is active ─────────────────
+        # SQLAlchemy's expire_on_commit=True expires all ORM attributes after
+        # every session.commit().  Reading an expired attribute outside an open
+        # session raises DetachedInstanceError.  Capturing plain Python locals
+        # here means every subsequent read is a dict/str/uuid lookup — no ORM
+        # lazy-load is ever needed after this point.
+        task_step_id: str | None = task.step_id
+        task_job_id: uuid.UUID = task.job_id
+        task_type: str = task.task_type
+        task_tool_name: str | None = task.tool_name
+        task_status: str = task.status
+
         # ── Guard: task already in a terminal state ───────────────────────────
         # Handles at-least-once redelivery — Celery may redeliver a task after
         # a worker crash even though a previous worker already completed it.
-        if task.status in ("succeeded", "failed", "skipped"):
+        if task_status in ("succeeded", "failed", "skipped"):
             logger.info(
                 "execute_step: task already terminal, skipping",
-                extra={"task_id": task_id, "status": task.status},
+                extra={"task_id": task_id, "status": task_status},
             )
             return {
                 "task_id": task_id,
-                "status": task.status,
-                "step_id": task.step_id,
+                "status": task_status,
+                "step_id": task_step_id,
                 "newly_enqueued": [],
             }
 
         # ── Pre-flight: skip if job already terminal ──────────────────────────
         # Handles the race where a task was queued before a sibling failed.
-        job = session.get(JobModel, task.job_id)
+        job = session.get(JobModel, task_job_id)
         if job and job.status in ("failed", "cancelled"):
-            if task.status not in ("succeeded", "failed", "skipped"):
+            if task_status not in ("succeeded", "failed", "skipped"):
                 task.status = "skipped"
                 session.commit()
                 metrics.task_executions_total.labels(
-                    task_type=task.task_type, status="skipped"
+                    task_type=task_type, status="skipped"
                 ).inc()
             logger.info(
                 "execute_step: task skipped — job already terminal",
                 extra={
                     "task_id": task_id,
-                    "job_id": str(task.job_id),
+                    "job_id": str(task_job_id),
                     "job_status": job.status,
                 },
             )
             return {
                 "task_id": task_id,
                 "status": "skipped",
-                "step_id": task.step_id,
+                "step_id": task_step_id,
                 "newly_enqueued": [],
             }
 
@@ -138,7 +151,7 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
             return {
                 "task_id": task_id,
                 "status": "skipped",
-                "step_id": task.step_id,
+                "step_id": task_step_id,
                 "newly_enqueued": [],
             }
 
@@ -146,9 +159,9 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
             "execute_step: task claimed",
             extra={
                 "task_id": task_id,
-                "step_id": task.step_id,
-                "tool_name": task.tool_name,
-                "attempt": task.attempt_count,
+                "step_id": task_step_id,
+                "tool_name": task_tool_name,
+                "attempt": task.attempt_count,  # updated by _claim_task
             },
         )
 
@@ -165,24 +178,24 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
 
         # ── M7: retrieve memory context for synthesis tasks ───────────────────
         memory_context: list[str] = []
-        if task.task_type == "synthesis" and workspace_id and job:
+        if task_type == "synthesis" and workspace_id and job:
             memory_context = _retrieve_memory_context(workspace_id, task, job)
 
         # ── Invoke the tool ───────────────────────────────────────────────────
-        tool_name = task.tool_name or "synthesis"
+        tool_name = task_tool_name or "synthesis"
         tool_start = time.monotonic()
         try:
             output = _invoke_tool(task, memory_context=memory_context, session=session)
         except ToolError as exc:
             metrics.tool_calls_total.labels(tool_name=tool_name, status="failed").inc()
             metrics.task_executions_total.labels(
-                task_type=task.task_type, status="failed"
+                task_type=task_type, status="failed"
             ).inc()
             return _handle_task_failure(session, task, str(exc))
         except Exception as exc:
             # Transient errors: retry up to max_retries, then fail permanently.
             if self.request.retries < self.max_retries:
-                metrics.task_retries_total.labels(task_type=task.task_type).inc()
+                metrics.task_retries_total.labels(task_type=task_type).inc()
                 logger.warning(
                     "execute_step: transient error, retrying",
                     extra={
@@ -195,7 +208,7 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
                 raise self.retry(exc=exc, countdown=5)
             metrics.tool_calls_total.labels(tool_name=tool_name, status="failed").inc()
             metrics.task_executions_total.labels(
-                task_type=task.task_type, status="failed"
+                task_type=task_type, status="failed"
             ).inc()
             return _handle_task_failure(session, task, f"unexpected error: {exc}")
 
@@ -210,21 +223,21 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
         session.commit()
 
         task_elapsed = time.monotonic() - task_start
-        metrics.task_duration_seconds.labels(task_type=task.task_type).observe(task_elapsed)
+        metrics.task_duration_seconds.labels(task_type=task_type).observe(task_elapsed)
         metrics.task_executions_total.labels(
-            task_type=task.task_type, status="succeeded"
+            task_type=task_type, status="succeeded"
         ).inc()
         logger.info(
             "execute_step: task succeeded",
-            extra={"task_id": task_id, "step_id": task.step_id},
+            extra={"task_id": task_id, "step_id": task_step_id},
         )
 
         # ── M7: store tool output to memory ───────────────────────────────────
-        if task.task_type == "tool_call" and workspace_id:
+        if task_type == "tool_call" and workspace_id:
             _try_store_task_memory(task, output, workspace_id)
 
         # ── Update job terminal state ─────────────────────────────────────────
-        job_done = _check_job_completion(session, task.job_id)
+        job_done = _check_job_completion(session, task_job_id)
 
         # ── M7: store job result to memory when job just succeeded ────────────
         if job_done and workspace_id:
@@ -237,10 +250,11 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
         if not job_done:
             newly_enqueued = _enqueue_newly_ready(session, task)
 
+    # task_step_id is a plain str local — safe to read after session closes.
     return {
         "task_id": task_id,
         "status": "succeeded",
-        "step_id": task.step_id,
+        "step_id": task_step_id,
         "newly_enqueued": newly_enqueued,
     }
 
@@ -322,6 +336,7 @@ def _invoke_tool(
     """
     if task.task_type == "synthesis":
         collected: list[dict[str, Any]] = []
+        job_prompt: str = ""
         if session is not None:
             siblings = (
                 session.query(TaskModel)
@@ -341,16 +356,12 @@ def _invoke_tool(
                     "tool_name": s.tool_name,
                     "output":    s.tool_output,
                 })
+            job = session.get(JobModel, task.job_id)
+            job_prompt = (job.prompt if job else "") or ""
 
-        n = len(collected)
-        summary = (
-            f"Aggregated {n} completed step{'s' if n != 1 else ''}: "
-            + ", ".join(c["name"] or c["step_id"] or "" for c in collected)
-            if collected
-            else "No tool_call steps completed successfully."
-        )
+        final_answer = _llm_synthesize(job_prompt, collected, memory_context or [])
         result: dict[str, Any] = {
-            "note":            summary,
+            "final_answer":    final_answer,
             "collected_steps": collected,
         }
         if memory_context:
@@ -565,7 +576,7 @@ def _check_job_completion(session: Session, job_id: uuid.UUID) -> bool:
         )
         if synthesis and synthesis.tool_output:
             raw = synthesis.tool_output
-            job.result = raw.get("note") or str(raw)
+            job.result = raw.get("final_answer") or raw.get("note") or str(raw)
         else:
             job.result = "All steps completed successfully"
         session.commit()
@@ -619,6 +630,81 @@ def _enqueue_newly_ready(session: Session, completed_task: TaskModel) -> list[st
         )
 
     return enqueued
+
+
+# ---------------------------------------------------------------------------
+# LLM-based synthesis helper
+# ---------------------------------------------------------------------------
+
+def _llm_synthesize(
+    job_prompt: str,
+    collected: list[dict[str, Any]],
+    memory_context: list[str],
+) -> str:
+    """
+    Generate a final answer by calling the LLM with the original user prompt
+    and the collected tool outputs as context.
+
+    Falls back to a plain-text summary if OpenAI is not configured or the
+    API call fails — synthesis is never blocked by LLM availability.
+    """
+    # Build the context block from collected tool outputs
+    context_parts: list[str] = []
+    for i, step in enumerate(collected, 1):
+        name = step.get("name") or step.get("step_id") or f"Step {i}"
+        tool = step.get("tool_name") or "tool"
+        output = step.get("output") or {}
+        # Truncate very large outputs so we stay within token limits
+        output_str = str(output)[:1500]
+        context_parts.append(f"Step {i} — {name} ({tool}):\n{output_str}")
+
+    if memory_context:
+        context_parts.append(
+            "Relevant past context:\n" + "\n".join(memory_context)
+        )
+
+    context_text = "\n\n".join(context_parts) if context_parts else "(no tool outputs available)"
+
+    synthesis_prompt = (
+        f"You are a helpful AI assistant synthesising the results of an agent pipeline.\n\n"
+        f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
+        f"COMPLETED TOOL OUTPUTS:\n{context_text}\n\n"
+        f"Using the above information, write a clear, complete, and concise final answer "
+        f"to the user's original request. Do not repeat the tool outputs verbatim — "
+        f"synthesise them into a coherent response."
+    )
+
+    # Try OpenAI if configured (same check as planner factory)
+    if settings.openai_api_key and settings.openai_api_key not in ("sk-not-set", ""):
+        try:
+            from openai import OpenAI, OpenAIError
+            client = OpenAI(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url,
+            )
+            response = client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[{"role": "user", "content": synthesis_prompt}],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            answer = (response.choices[0].message.content or "").strip()
+            if answer:
+                logger.info("LLM synthesis succeeded (%d chars)", len(answer))
+                return answer
+        except Exception as exc:
+            logger.warning("LLM synthesis failed, using fallback: %s", exc)
+
+    # Fallback: structured plain-text summary
+    if not collected:
+        return f"No tool steps completed successfully for: {job_prompt}"
+
+    lines = [f"Summary for: {job_prompt}\n"]
+    for i, step in enumerate(collected, 1):
+        name = step.get("name") or step.get("step_id") or f"Step {i}"
+        output = step.get("output") or {}
+        lines.append(f"{i}. {name}: {str(output)[:300]}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

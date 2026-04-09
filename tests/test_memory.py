@@ -429,7 +429,7 @@ class TestSynthesisEnrichment:
 
         output = _invoke_tool(task, memory_context=None)
         assert "memory_context" not in output
-        assert "note" in output
+        assert "final_answer" in output
 
     def test_retrieve_memory_context_returns_entry_contents(self) -> None:
         from worker.memory.base import MemoryEntry
