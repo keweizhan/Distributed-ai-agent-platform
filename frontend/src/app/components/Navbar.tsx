@@ -42,16 +42,10 @@ export default function Navbar() {
           </Link>
           <div className="flex items-center gap-4">
             <Link
-              href="/dashboard"
+              href="/chat"
               className="text-sm text-gray-500 hover:text-gray-900"
             >
-              Dashboard
-            </Link>
-            <Link
-              href="/jobs/new"
-              className="text-sm text-gray-500 hover:text-gray-900"
-            >
-              New Job
+              Chat
             </Link>
           </div>
         </div>

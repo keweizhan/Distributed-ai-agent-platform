@@ -674,8 +674,24 @@ def _llm_synthesize(
         f"synthesise them into a coherent response."
     )
 
+    # Try ZhipuAI if configured (takes priority over OpenAI)
+    if settings.zhipu_api_key:
+        try:
+            from zhipuai import ZhipuAI
+            client = ZhipuAI(api_key=settings.zhipu_api_key)
+            resp = client.chat.completions.create(
+                model=settings.zhipu_model,
+                messages=[{"role": "user", "content": synthesis_prompt}],
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            if answer:
+                logger.info("ZhipuAI synthesis succeeded (%d chars)", len(answer))
+                return answer
+        except Exception as exc:
+            logger.warning("ZhipuAI synthesis failed, using fallback: %s", exc)
+
     # Try OpenAI if configured (same check as planner factory)
-    if settings.openai_api_key and settings.openai_api_key not in ("sk-not-set", ""):
+    elif settings.openai_api_key and settings.openai_api_key not in ("sk-not-set", ""):
         try:
             from openai import OpenAI, OpenAIError
             client = OpenAI(

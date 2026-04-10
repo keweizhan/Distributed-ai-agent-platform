@@ -154,3 +154,7 @@ export async function getJob(id: string): Promise<JobDetail> {
 export async function cancelJob(id: string): Promise<Job> {
   return request<Job>(`/jobs/${id}/cancel`, { method: "POST" });
 }
+
+export async function deleteJob(id: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/jobs/${id}`, { method: "DELETE" });
+}

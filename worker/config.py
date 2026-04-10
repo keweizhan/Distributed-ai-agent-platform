@@ -8,8 +8,14 @@ class Settings(BaseSettings):
     celery_result_backend: str
 
     openai_api_key: str = "sk-not-set"
-    openai_base_url: str = "https://api.openai.com/v1"
+    openai_base_url: str | None = None   # None → SDK default (api.openai.com/v1)
     openai_model: str = "gpt-4o-mini"
+
+    zhipu_api_key: str = ""              # set to enable ZhipuAI synthesis
+    zhipu_model: str = "glm-4-flash"
+
+    tavily_api_key: str = ""             # set to enable Tavily as primary search
+    tavily_max_results: int = 5
 
     sandbox_backend: str = "subprocess"          # "subprocess" | "docker"
     sandbox_image: str = "python:3.11-slim"

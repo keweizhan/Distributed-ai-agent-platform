@@ -145,6 +145,39 @@ async def cancel_job(
 
 
 # ---------------------------------------------------------------------------
+# DELETE /jobs/{job_id}  — permanently remove a job and its tasks
+# ---------------------------------------------------------------------------
+
+@router.delete(
+    "/{job_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete a job",
+    responses={404: {"description": "Job not found"}},
+)
+async def delete_job(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    workspace: WorkspaceModel = Depends(get_current_workspace),
+) -> dict:
+    """
+    Permanently delete a job and all its associated tasks.
+
+    Tasks are removed via SQLAlchemy's cascade="all, delete-orphan" on the
+    JobModel.tasks relationship (backed by ondelete="CASCADE" on the FK).
+    Only jobs that belong to the caller's workspace can be deleted.
+    """
+    result = await db.execute(
+        select(JobModel).where(JobModel.id == job_id, JobModel.workspace_id == workspace.id)
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await db.delete(job)
+    await db.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # GET /jobs/{job_id}/tasks/{task_id}  — inspect a single task
 # ---------------------------------------------------------------------------
 
