@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -77,7 +77,7 @@ function jobToMessages(detail: JobDetail): Message[] {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function ChatPage() {
+function ChatPage() {
   const router       = useRouter();
   const searchParams = useSearchParams();
   const jobId        = searchParams.get("jobId");
@@ -332,5 +332,13 @@ export default function ChatPage() {
       </div>
 
     </div>
+  );
+}
+
+export default function ChatPageWrapper() {
+  return (
+    <Suspense fallback={null}>
+      <ChatPage />
+    </Suspense>
   );
 }
