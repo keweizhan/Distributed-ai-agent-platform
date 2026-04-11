@@ -29,14 +29,21 @@ type Message = {
 const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
 const POLL_MS = 2000;
 
-const TASK_DOT: Record<string, string> = {
-  pending:   "bg-gray-300",
-  queued:    "bg-yellow-400",
-  running:   "bg-blue-500 animate-pulse",
-  succeeded: "bg-green-500",
-  failed:    "bg-red-500",
-  skipped:   "bg-gray-300",
-};
+// Step status icon: checkmark for done, animated dot for running, plain dot otherwise
+function StepIcon({ status }: { status: string }) {
+  if (status === "succeeded")
+    return (
+      <svg className="h-3.5 w-3.5 shrink-0 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+      </svg>
+    );
+  if (status === "running")
+    return <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-500 animate-pulse" />;
+  if (status === "failed")
+    return <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-red-500" />;
+  // pending / queued / skipped
+  return <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-gray-300" />;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -59,7 +66,7 @@ function jobToMessages(detail: JobDetail): Message[] {
     detail.status === "succeeded"
       ? (detail.result ?? "Done.")
       : detail.status === "failed"
-      ? `Something went wrong: ${detail.error ?? "unknown error"}`
+      ? "The agent couldn't complete this request. Try rephrasing your prompt."
       : progressText(detail);
 
   return [
@@ -73,6 +80,17 @@ function jobToMessages(detail: JobDetail): Message[] {
       tasks:     detail.tasks,
     },
   ];
+}
+
+// Animated three-dot indicator shown while a job is in-progress
+function LoadingDots() {
+  return (
+    <span className="ml-1 inline-flex items-center gap-0.5 align-middle">
+      <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:-0.3s]" />
+      <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:-0.15s]" />
+      <span className="h-1 w-1 animate-bounce rounded-full bg-current" />
+    </span>
+  );
 }
 
 function generateId() {
@@ -165,7 +183,7 @@ function ChatPage() {
               content:
                 detail.status === "succeeded"
                   ? (detail.result ?? "Done.")
-                  : `Something went wrong: ${detail.error ?? "unknown error"}`,
+                  : "The agent couldn't complete this request. Try rephrasing your prompt.",
               jobStatus: detail.status,
               jobId:     job.id,
               tasks:     detail.tasks,
@@ -263,8 +281,36 @@ function ChatPage() {
                         : "border-gray-200 bg-gray-50 text-gray-500"
                     }`}
                   >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    {msg.jobStatus && !TERMINAL.has(msg.jobStatus) ? (
+                      /* In-progress: single-line status + animated dots */
+                      <p className="flex items-center">
+                        {msg.content}
+                        <LoadingDots />
+                      </p>
+                    ) : (
+                      /* Terminal: preserve whitespace for multi-line LLM output */
+                      <p className="whitespace-pre-wrap">{msg.content}</p>
+                    )}
                   </div>
+
+                  {/* Step list — shown while running and kept (dimmed) after terminal */}
+                  {msg.tasks && msg.tasks.length > 0 && (
+                    <div className={`space-y-1.5 pl-1 transition-opacity ${
+                      TERMINAL.has(msg.jobStatus ?? "") ? "opacity-50" : ""
+                    }`}>
+                      {msg.tasks
+                        .filter((t) => t.task_type !== "synthesis")
+                        .sort((a, b) => a.sequence - b.sequence)
+                        .map((t) => (
+                          <div key={t.id} className="flex items-center gap-2 text-xs text-gray-500">
+                            <StepIcon status={t.status} />
+                            <span className={t.status === "running" ? "font-medium text-blue-600" : ""}>
+                              {t.name}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                  )}
 
                   {/* "View technical details" — shown after job reaches terminal state */}
                   {TERMINAL.has(msg.jobStatus ?? "") && msg.jobId && (
@@ -277,29 +323,6 @@ function ChatPage() {
                       </Link>
                     </div>
                   )}
-
-                  {/* Step dots — visible only while in-progress */}
-                  {msg.tasks &&
-                    msg.tasks.length > 0 &&
-                    !TERMINAL.has(msg.jobStatus ?? "") && (
-                      <div className="space-y-1 pl-2">
-                        {msg.tasks
-                          .filter((t) => t.task_type !== "synthesis")
-                          .sort((a, b) => a.sequence - b.sequence)
-                          .map((t) => (
-                            <div key={t.id} className="flex items-center gap-2 text-xs text-gray-400">
-                              <span
-                                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                                  TASK_DOT[t.status] ?? "bg-gray-300"
-                                }`}
-                              />
-                              <span className={t.status === "running" ? "text-blue-500" : ""}>
-                                {t.name}
-                              </span>
-                            </div>
-                          ))}
-                      </div>
-                    )}
                 </div>
               )}
             </div>

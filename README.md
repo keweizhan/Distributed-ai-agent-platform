@@ -1,385 +1,274 @@
 # Distributed AI Agent Platform
 
-A production-oriented distributed system that accepts natural language requests, generates structured execution plans via LLM, and dispatches tasks asynchronously across worker nodes with tool invocation, sandboxed code execution, and full Prometheus observability.
+A full-stack AI agent system that accepts natural-language prompts, decomposes them into a multi-step execution plan using an LLM, runs each step in parallel across Celery workers, and streams live progress back to a chat-style web UI. The platform is designed for production deployment — multi-tenant by default, provider-agnostic for LLMs, and observable via a pre-wired Prometheus + Grafana stack.
 
 ---
 
-## Quick Start
+## Screenshots
 
-```bash
-cp .env.example .env
-docker compose up --build
-```
-
-| Service | URL |
-|---------|-----|
-| API + Swagger UI | http://localhost:8000/docs |
-| Prometheus | http://localhost:9091 |
-| Grafana | http://localhost:3000 (no login required) |
-| Qdrant UI | http://localhost:6333/dashboard (when `MEMORY_ENABLED=true`) |
-
-The **Agent Platform** Grafana dashboard is pre-loaded under the Agent Platform folder.
-
-No OpenAI key required — the built-in `MockPlanner` exercises the full execution path without any API calls.
+> **Suggested placements:**
+> 1. `docs/screenshots/chat-running.png` — chat UI mid-execution: assistant bubble showing "Running tools…" with animated step progress list
+> 2. `docs/screenshots/chat-complete.png` — chat UI after completion: final answer bubble, green checkmarks on each step, "View technical details →" link
+> 3. `docs/screenshots/sidebar-history.png` — collapsed/expanded sidebar showing job history with hover-delete
+> 4. `docs/screenshots/grafana-dashboard.png` — Grafana: task throughput, duration histogram, queue depth
 
 ---
 
-## Minimal Server Deploy (HTTP, no domain required)
+## Key Features
 
-For a first Tencent Cloud / any Ubuntu VM demo without a domain name or TLS certificate.
-Open **port 8000** inbound in your cloud security group, then:
-
-```bash
-# 1. Install Docker (one-liner, Ubuntu 22.04)
-curl -fsSL https://get.docker.com | sudo bash
-sudo usermod -aG docker $USER && newgrp docker
-
-# 2. Clone and configure
-git clone <your-repo-url> ~/app && cd ~/app
-cp .env.example .env
-
-# Edit two lines in .env (minimum required for any public server):
-#   JWT_SECRET_KEY=<run: python3 -c "import secrets; print(secrets.token_hex(32))">
-#   POSTGRES_PASSWORD=<any strong password>
-# Then update DATABASE_URL to match the new POSTGRES_PASSWORD:
-#   DATABASE_URL=postgresql+asyncpg://agent:<password>@postgres:5432/agentdb
-nano .env   # or vim / sed
-
-# 3. Start only the four core services (skip prometheus/grafana/qdrant for now)
-docker compose up -d --build postgres redis api worker
-
-# 4. Validate
-curl http://<server-ip>:8000/health          # → {"status":"ok"}
-curl http://<server-ip>:8000/ready           # → {"status":"ready","db":"ok"}
-
-# 5. Register + get token + submit a job
-curl -s -X POST http://<server-ip>:8000/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email":"demo@example.com","password":"demopassword"}' | jq .
-
-TOKEN=$(curl -s -X POST http://<server-ip>:8000/auth/token \
-  -d "username=demo@example.com&password=demopassword" | jq -r .access_token)
-
-JOB=$(curl -s -X POST http://<server-ip>:8000/jobs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"search for the latest Python release"}' | jq -r .id)
-
-# 6. Poll until succeeded
-watch -n 3 "curl -s -H 'Authorization: Bearer $TOKEN' \
-  http://<server-ip>:8000/jobs/$JOB | jq '{status,result}'"
-```
-
-Swagger UI is available at `http://<server-ip>:8000/docs`.
-
-When you have a domain name, follow [docs/deployment.md](docs/deployment.md) for the full nginx + TLS + production hardening path.
+| Category | Feature |
+|---|---|
+| **Agent** | LLM-based task planning — prompt → validated `ExecutionPlan` with dependency graph |
+| **Agent** | Parallel multi-step tool execution respecting declared dependencies |
+| **Agent** | LLM synthesis step aggregates all tool outputs into a final answer |
+| **Agent** | Provider-agnostic LLM (OpenAI, DeepSeek, Moonshot, OpenRouter, ZhipuAI) |
+| **Tools** | Web search via Tavily (primary) with DuckDuckGo fallback |
+| **Tools** | Sandboxed code execution (subprocess or Docker backend) |
+| **Tools** | Pluggable tool registry — new tools added with a single decorator |
+| **Backend** | Async job pipeline: plan → dispatch → execute → synthesize |
+| **Backend** | Atomic task claiming — concurrent workers cannot double-execute a step |
+| **Backend** | Automatic fast-fail: any task failure marks the job failed and skips dependents |
+| **Backend** | At-least-once retry with configurable `max_retries` per task |
+| **Auth** | JWT-based auth with per-user workspace isolation (all queries are tenant-scoped) |
+| **Frontend** | Chat-style UI: live step progress, animated status indicators, friendly error copy |
+| **Frontend** | Collapsible job history sidebar with per-row delete |
+| **Frontend** | "View technical details" drill-down to full task tree and JSON I/O |
+| **Observability** | Prometheus metrics on every task execution, tool call, and HTTP request |
+| **Observability** | Pre-provisioned Grafana dashboard (no manual setup required) |
+| **Memory** | Optional Qdrant-backed semantic memory — past results surfaced as planner context |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Client                                                         │
-│  POST /auth/register → POST /auth/token → Bearer JWT           │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │ HTTPS
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  FastAPI  (api/)                                                │
-│  ├─ /auth  — register, token, me                               │
-│  ├─ /jobs  — submit, list, detail, cancel, task-detail         │
-│  ├─ /health, /ready, /metrics                                  │
-│  └─ workspace-scoped: every query includes WHERE workspace_id  │
-└────────┬──────────────────────┬──────────────────────────────────┘
-         │ write job row        │ enqueue plan_job
-         ▼                      ▼
-┌────────────────┐    ┌──────────────────────────────────────────┐
-│  PostgreSQL    │    │  Celery Worker  (worker/)                │
-│  jobs          │◄───│                                          │
-│  tasks         │    │  plan_job task                           │
-│  users         │    │  ├─ [M7] Qdrant memory search           │
-│  workspaces    │    │  ├─ MockPlanner / OpenAIPlanner          │
-└────────────────┘    │  └─ persist TaskModel rows              │
-                      │                                          │
-         ┌────────────│  execute_step task                       │
-         │  Redis     │  ├─ atomic claim guard                   │
-         │  broker    │  ├─ tool registry dispatch               │
-         │  results   │  │   ├─ web_search (DuckDuckGo)         │
-         └────────────│  │   ├─ code_exec (subprocess/Docker)   │
-                      │  │   └─ synthesis (LLM summarise)       │
-                      │  └─ [M7] store tool_output / job_result │
-                      └──────────────────────────────────────────┘
-                                          │
-                             ┌────────────┴────────────┐
-                             │                         │
-                    ┌────────▼───────┐       ┌────────▼────────┐
-                    │  Prometheus    │       │  Qdrant         │
-                    │  :9090 scrape  │       │  vector memory  │
-                    └────────┬───────┘       │  (optional)     │
-                             │               └─────────────────┘
-                    ┌────────▼───────┐
-                    │  Grafana       │
-                    │  dashboards    │
-                    └────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  Browser  (Next.js 14 · TypeScript · Tailwind CSS)   │
+│  Chat UI · Sidebar history · Job detail drill-down   │
+└────────────────────┬─────────────────────────────────┘
+                     │ HTTPS  (polling GET /jobs/{id})
+                     ▼
+┌──────────────────────────────────────────────────────┐
+│  Nginx  (TLS termination · reverse proxy)            │
+└────────────────────┬─────────────────────────────────┘
+                     │
+                     ▼
+┌──────────────────────────────────────────────────────┐
+│  FastAPI  (REST · JWT auth · workspace scoping)      │
+│  POST /jobs   GET /jobs/{id}   DELETE /jobs/{id}     │
+└──────┬───────────────────────────────┬───────────────┘
+       │ writes job row                │ Celery send_task
+       ▼                               ▼
+┌─────────────┐              ┌─────────────────────────┐
+│  PostgreSQL │◄─────────────│  Redis  (broker/cache)  │
+│  jobs       │              └─────────────────────────┘
+│  tasks      │                         │
+│  users      │              ┌──────────┴──────────┐
+│  workspaces │              │                     │
+└─────────────┘   ┌──────────▼──────┐  ┌──────────▼────────┐
+                  │ Planner worker  │  │ Executor worker(s) │
+                  │  calls LLM      │  │  invokes tools     │
+                  │  writes plan    │  │  parallel tasks    │
+                  └─────────────────┘  └───────────────────┘
+                                                │
+                               ┌────────────────┴───────────┐
+                               │  Tool registry             │
+                               │  web_search  (Tavily/DDG)  │
+                               │  code_exec   (Docker/proc) │
+                               └────────────────────────────┘
+                                        │  optional
+                                        ▼
+                               ┌────────────────────────────┐
+                               │  Qdrant  (semantic memory) │
+                               └────────────────────────────┘
 ```
 
-| Component | Technology | Role |
-|-----------|-----------|------|
-| API Server | FastAPI + asyncpg | Accept requests, persist jobs, enqueue work |
-| Task Queue | Celery + Redis | Async task dispatch and routing |
-| Planner | Celery + OpenAI SDK | LLM → structured ExecutionPlan (MockPlanner fallback) |
-| Executor | Celery | Run task steps via tool registry |
-| Tool: web_search | DuckDuckGo HTTP | Retrieve web results |
-| Tool: code_exec | Subprocess / Docker | Execute Python safely with resource limits |
-| State Store | PostgreSQL | Jobs, tasks, tool I/O, audit trail |
-| Auth | JWT (HS256) + bcrypt | User/Workspace models, workspace-scoped isolation |
-| Memory | Qdrant + embeddings | Semantic retrieval of past results (optional) |
-| Metrics | prometheus_client | Counters + histograms for tasks, tools, HTTP |
-| Dashboards | Grafana + Prometheus | Pre-configured agent-platform dashboard |
+### Services
+
+| Service | Role |
+|---|---|
+| `api` | FastAPI — accepts requests, stores jobs, dispatches to Celery |
+| `worker` | Celery — runs planner and executor task types on separate queues |
+| `postgres` | Primary datastore — jobs, tasks, users, workspaces |
+| `redis` | Celery broker and result backend |
+| `nginx` | TLS termination + reverse proxy (production only) |
+| `prometheus` | Scrapes `/metrics` from API and worker |
+| `grafana` | Pre-provisioned dashboards — no manual setup required |
+| `qdrant` | Vector store for semantic memory (optional, off by default) |
 
 ---
 
-## Authentication
-
-Every `/jobs` endpoint requires a Bearer JWT.
+## End-to-End Request Flow
 
 ```
-POST /auth/register  →  creates User + Workspace, returns user info
-POST /auth/token     →  email + password → JWT (HS256, configurable TTL)
-GET  /auth/me        →  current user (token required)
+1.  User types a prompt in the chat UI and presses Enter.
+
+2.  POST /jobs → API creates a JobModel (status: pending) and
+    enqueues TASK_PLAN_JOB on the planner Celery queue.
+
+3.  Planner worker picks up the job, calls the configured LLM with a
+    structured system prompt, and parses the response into a validated
+    ExecutionPlan (PlannedSteps with declared dependencies).
+    Tasks are written to PostgreSQL; job moves to "planned".
+
+4.  Ready tasks (those with no unmet dependencies) are dispatched to
+    the executor queue. Job moves to "running".
+
+5.  Executor workers claim tasks atomically (WHERE-guarded UPDATE to
+    prevent double-execution across concurrent workers). Each task
+    invokes its registered tool, stores tool_output, marks "succeeded".
+
+6.  After each completion, the executor re-evaluates the dependency
+    graph and dispatches any newly-unblocked tasks.
+
+7.  When all tasks are terminal, a synthesis task runs: the LLM reads
+    every tool_output and writes a final coherent answer into job.result.
+
+8.  The frontend polls GET /jobs/{id} every 2 seconds and updates the
+    assistant bubble in real time:
+      pending   →  "Thinking…"
+      planning  →  "Planning…"
+      running   →  "Running tools…" + live step progress list
+      succeeded →  final answer (multi-line, whitespace-preserved)
+      failed    →  friendly error message + "View technical details"
 ```
-
-Token claims: `sub=user_id`. On each request the API resolves the user's workspace and scopes every DB query by `workspace_id`. A request for a job in another workspace returns **404** — indistinguishable from a missing resource (no information leakage).
-
-```bash
-# 1. Register (creates a workspace automatically)
-curl -s -X POST http://localhost:8000/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "dev@example.com", "password": "devpassword"}' | jq .
-
-# 2. Get a token
-TOKEN=$(curl -s -X POST http://localhost:8000/auth/token \
-  -d "username=dev@example.com&password=devpassword" | jq -r .access_token)
-
-# 3. All job requests use the token
-curl -s http://localhost:8000/auth/me \
-  -H "Authorization: Bearer $TOKEN" | jq .
-```
-
-Swagger UI: click **Authorize 🔒** at http://localhost:8000/docs → paste the token value into the **Value** field (no `Bearer` prefix — Swagger adds it automatically) → click **Authorize** → **Close**.
 
 ---
 
-## End-to-End Demo
+## Tech Stack
 
-### 1. Register and get a token
+**Backend**
+- Python 3.11, FastAPI + Uvicorn (async API)
+- Celery 5 + Redis 7 (distributed task queue, two named queues: `planner`, `executor`)
+- SQLAlchemy 2 (async ORM) + PostgreSQL 16
+- Pydantic v2 (request/response validation, `ExecutionPlan` schema enforcement)
+- `openai` SDK — used for any OpenAI-compatible provider
+- `zhipuai` SDK — optional ZhipuAI/GLM synthesis path
+- `tavily-python` + `duckduckgo-search` — layered web search (Tavily → DDG fallback)
+- `prometheus_client` — per-task, per-tool, and per-endpoint metrics
 
-```bash
-curl -s -X POST http://localhost:8000/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "dev@example.com", "password": "devpassword"}' | jq .
+**Frontend**
+- Next.js 14 (App Router), TypeScript, React 18
+- Tailwind CSS 3
+- Polling-based live updates (no WebSocket dependency)
 
-TOKEN=$(curl -s -X POST http://localhost:8000/auth/token \
-  -d "username=dev@example.com&password=devpassword" | jq -r .access_token)
-```
-
-### 2. Submit a job
-
-```bash
-JOB=$(curl -s -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"prompt": "Research the latest advances in transformer architectures and summarise the key findings"}' \
-  | jq -r .id)
-echo "Job ID: $JOB"
-```
-
-### 3. Watch it execute
-
-```bash
-watch -n 2 "curl -s -H 'Authorization: Bearer $TOKEN' http://localhost:8000/jobs/$JOB \
-  | jq '{status, result}'"
-```
-
-Typical progression (MockPlanner — no API key required):
-
-```
-pending → planning → planned → running
-  task web_search:   queued → running → succeeded
-  task analyse:      queued → running → succeeded
-  task synthesise:   queued → running → succeeded
-→ succeeded
-```
-
-### 4. Inspect a task's tool output
-
-```bash
-TASK_ID=$(curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/jobs/$JOB \
-  | jq -r '.tasks[] | select(.tool_name=="web_search") | .id')
-
-curl -s -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8000/jobs/$JOB/tasks/$TASK_ID \
-  | jq '{step_id, status, tool_name, tool_input, tool_output, attempt_count, started_at, finished_at}'
-```
-
-### 5. Cancel a running job
-
-```bash
-NEW_JOB=$(curl -s -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"prompt": "A long-running task"}' | jq -r .id)
-
-curl -s -X POST http://localhost:8000/jobs/$NEW_JOB/cancel \
-  -H "Authorization: Bearer $TOKEN" | jq .
-```
-
-### 6. View metrics in Grafana
-
-Open http://localhost:3000 → **Agent Platform** dashboard.
-
-Key panels: Tasks Succeeded/Failed · Task Execution Rate · Tool Duration p50/p95 · Queue-Wait Delay p95 · HTTP Request Duration p95.
+**Infrastructure**
+- Docker Compose (dev) / Docker Compose + Nginx (prod)
+- Let's Encrypt TLS via Certbot
+- Grafana 10 + Prometheus 2.51 — dashboard JSON provisioned at startup
+- Qdrant 1.9 — optional, activated with `MEMORY_ENABLED=true`
 
 ---
 
-## Memory Layer
+## Local Development Setup
 
-Optional Qdrant-backed semantic memory, disabled by default.
+### Prerequisites
 
-```
-Job succeeds         → store job_result  → Qdrant (scoped by workspace_id)
-Task tool_call ends  → store tool_output → Qdrant
+- Docker and Docker Compose v2
+- Node.js 18+ and npm (for the frontend dev server)
 
-Planning:   search(workspace_id, job.prompt, top_k=3)       → inject job_result context into LLM prompt
-Synthesis:  search(workspace_id, task.description, top_k=3) → inject into synthesis output
-```
-
-When `MEMORY_ENABLED=false` (default), all calls go to `NullMemoryStore` — pure no-op, zero Qdrant dependency.
-
-### What gets stored
-
-| Entry type | When | Content |
-|-----------|------|---------|
-| `tool_output` | After any `tool_call` task succeeds | `Tool: <name>\nTask: <name>\nOutput: <truncated>` |
-| `job_result` | After job transitions to `succeeded` | `Prompt: <prompt>\nResult: <result>` |
-
-### Enabling memory
+### 1. Clone and configure
 
 ```bash
-# In .env:
-MEMORY_ENABLED=true
-QDRANT_URL=http://qdrant:6333
-# Optional — leave as sk-not-set for the deterministic mock embedder (no API cost):
-OPENAI_API_KEY=sk-not-set
+git clone <repo-url>
+cd distributed-ai-agent-platform
+cp .env.example .env
 ```
 
-Workspace isolation: every stored entry carries `workspace_id` in the Qdrant payload. Every search applies a server-side `must` filter — a tenant can never read another tenant's entries.
+Open `.env` and set at minimum:
 
----
+```dotenv
+# LLM — leave as sk-not-set to use the built-in MockPlanner (no API cost)
+OPENAI_API_KEY=sk-...
 
-## API Reference
-
-### Auth (no token required)
-
-```
-POST   /auth/register    Create user + workspace → { id, email, created_at }
-POST   /auth/token       email+password → { access_token, token_type }
-GET    /auth/me          Current user info (token required)
+# Web search — leave blank to fall back to DuckDuckGo (no key required)
+TAVILY_API_KEY=tvly-...
 ```
 
-### Jobs (Bearer token required — workspace-scoped)
+The `MockPlanner` returns a deterministic test plan when no LLM key is configured — useful for exercising the execution pipeline without API costs.
 
-```
-POST   /jobs                         Submit a new job
-GET    /jobs                         List 50 most recent jobs (this workspace)
-GET    /jobs/{id}                    Job detail + all tasks
-POST   /jobs/{id}/cancel             Cancel a running job
-GET    /jobs/{id}/tasks/{task_id}    Full task detail (inputs, outputs, timestamps)
-```
-
-### System
-
-```
-GET    /health    Liveness probe
-GET    /ready     Readiness probe (checks DB connection)
-GET    /metrics   Prometheus scrape endpoint
-```
-
-### Status transitions
-
-```
-Job:   pending → planning → planned → running → succeeded / failed / cancelled
-Task:  pending → queued   → running → succeeded / failed / skipped
-```
-
-A cancelled job causes all in-flight and pending tasks to be skipped via the executor's pre-flight check.
-
----
-
-## Observability
-
-| Metric | Type | Labels |
-|--------|------|--------|
-| `agent_jobs_created_total` | Counter | — |
-| `agent_jobs_cancelled_total` | Counter | — |
-| `agent_job_plans_total` | Counter | status |
-| `agent_task_executions_total` | Counter | task_type, status |
-| `agent_task_duration_seconds` | Histogram | task_type |
-| `agent_task_queue_delay_seconds` | Histogram | — |
-| `agent_task_retries_total` | Counter | task_type |
-| `agent_tool_calls_total` | Counter | tool_name, status |
-| `agent_tool_duration_seconds` | Histogram | tool_name |
-| `agent_http_request_duration_seconds` | Histogram | method, path |
-
-**Single-process note:** The worker runs `--concurrency=1` so all metrics are captured in one process and visible at `:9090`. For higher concurrency in production, set `PROMETHEUS_MULTIPROC_DIR` (prometheus_client multiprocess mode) and increase concurrency.
-
----
-
-## Sandbox Execution
-
-`code_exec` runs user-supplied Python through a pluggable sandbox backend.
-
-| Backend | Isolation | Use case |
-|---------|-----------|---------|
-| `subprocess` (default) | Timeout only | Dev / CI |
-| `docker` | CPU + memory + network + read-only fs | Production |
+### 2. Start backend services
 
 ```bash
-# .env
-SANDBOX_BACKEND=docker
-SANDBOX_IMAGE=python:3.11-slim
-SANDBOX_TIMEOUT_SECONDS=30
+docker compose up -d
 ```
 
-Docker safety boundaries: network disabled, 128 MiB memory limit, 50% CPU quota, read-only workspace volume, container force-removed after every run.
+PostgreSQL, Redis, the API, a Celery worker, Prometheus, Grafana, and Qdrant all start together. The database schema is applied automatically on first boot via `infra/init.sql`.
 
----
+| Service | URL |
+|---|---|
+| API + interactive docs | http://localhost:8000/docs |
+| Grafana dashboards | http://localhost:3000 |
+| Prometheus | http://localhost:9091 |
 
-## Execution Hardening
-
-| Guard | Mechanism |
-|-------|-----------|
-| Duplicate execution | `UPDATE tasks SET status='running' WHERE id=? AND status IN ('pending','queued')` — rowcount=0 → skip |
-| Duplicate enqueue | Same atomic UPDATE `pending` → `queued` before `send_task()` |
-| Terminal task guard | Pre-check: task already in succeeded/failed/skipped → return immediately |
-| Terminal job guard | `_check_job_completion` never overwrites a terminal status |
-| Audit trail | `attempt_count`, `started_at`, `finished_at` on every task row |
-
----
-
-## Running Tests
+### 3. Start the frontend
 
 ```bash
-pip install -r requirements-dev.txt
-export PYTHONPATH=$(pwd)
-pytest                              # all 186 tests (no running Docker required)
-pytest tests/test_memory.py -v      # memory layer: store, search, embeddings, isolation
-pytest tests/test_auth.py -v        # JWT auth + workspace isolation
-pytest tests/test_api.py -v         # API endpoint tests
-pytest tests/test_metrics.py -v     # Prometheus metrics
-pytest tests/test_executor.py -v    # executor + hardening
-pytest tests/test_sandbox.py -v     # sandbox abstraction
+cd frontend
+npm install
+npm run dev          # → http://localhost:3001
+```
+
+### 4. Try it
+
+1. Open http://localhost:3001, register an account, and you land on the Chat page.
+2. Submit a prompt: *"Find the top 5 Python web frameworks and summarise each one."*
+3. Watch the planner create tasks, then see each step complete in the live step list.
+4. Click **View technical details** to inspect raw tool inputs and outputs.
+
+### Switching LLM providers
+
+The worker reads a single set of env vars — swap them to change provider with no code changes:
+
+```dotenv
+# DeepSeek
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-chat
+
+# Moonshot
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.moonshot.cn/v1
+OPENAI_MODEL=moonshot-v1-8k
+
+# ZhipuAI (synthesis only; planner still uses OpenAI-compatible key above)
+ZHIPU_API_KEY=...
+ZHIPU_MODEL=glm-4-flash
+```
+
+---
+
+## Deployment
+
+A production-hardened Compose file is provided at `docker-compose.prod.yml`.
+
+```bash
+# 1. Generate strong secrets and write .env.prod
+bash scripts/gen-env.sh
+
+# 2. Provision TLS certificate (requires SERVER_NAME in .env.prod)
+bash scripts/setup-server.sh
+
+# 3. Build images and start all services
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+**Key production differences:**
+
+- Images are fully self-contained (no source bind-mounts)
+- Internal services (Postgres, Redis, Qdrant, Prometheus) have no public ports
+- Nginx terminates TLS on 80/443 and proxies to the API container on the internal Docker network
+- Redis requires password authentication
+- Grafana requires admin login; accessible via SSH tunnel only (`ssh -L 3000:localhost:3000 user@server`)
+- Worker concurrency raised to 2 (tune with `--concurrency` to match CPU count)
+- Log rotation configured on all containers (50 MB per file, 5 files max)
+
+**Frontend:** build the Next.js app and deploy the output to any static host or Node server:
+
+```bash
+cd frontend
+NEXT_PUBLIC_API_BASE_URL=https://your-api-domain.com npm run build
+npm start
 ```
 
 ---
@@ -388,65 +277,59 @@ pytest tests/test_sandbox.py -v     # sandbox abstraction
 
 ```
 .
-├── api/
-│   ├── auth/               # JWT utils, FastAPI dependencies (get_current_workspace)
-│   ├── db/                 # SQLAlchemy ORM models + async session
-│   ├── routers/
-│   │   ├── auth.py         # POST /auth/register, /auth/token, GET /auth/me
-│   │   └── jobs.py         # POST /jobs, GET /jobs, cancel, task detail (workspace-scoped)
-│   ├── schemas/
-│   │   ├── auth.py         # UserCreate, UserResponse, TokenResponse
-│   │   └── job.py          # CreateJobRequest, JobResponse, TaskResponse
-│   ├── metrics.py          # API Prometheus metrics
-│   └── main.py             # App setup, /health, /ready, /metrics
-├── worker/
-│   ├── memory/             # Qdrant-backed memory layer (NullMemoryStore when disabled)
-│   ├── planner/            # BasePlanner, MockPlanner, OpenAIPlanner
-│   ├── sandbox/            # BaseSandbox, DockerSandbox, SubprocessSandbox
-│   ├── tasks/              # plan_job and execute_step Celery tasks
-│   ├── tools/              # web_search, code_exec, registry
-│   ├── db/                 # Sync SQLAlchemy for Celery tasks
-│   ├── metrics.py          # Worker Prometheus metrics
-│   └── celery_app.py       # Celery config + metrics server startup
-├── shared/                 # Domain models + constants
-├── tests/                  # 186 unit tests (no running Docker required)
+├── api/                    FastAPI application
+│   ├── routers/            jobs.py  auth.py
+│   ├── db/                 SQLAlchemy models, async session
+│   └── schemas/            Pydantic request / response schemas
+├── worker/                 Celery workers
+│   ├── tasks/              planner.py  executor.py
+│   ├── planner/            LLM planner (OpenAI-compatible) + MockPlanner
+│   ├── tools/              web_search.py  code_exec.py  registry.py
+│   └── memory/             Qdrant-backed semantic memory (optional)
+├── shared/                 Constants and models shared by api + worker
+├── frontend/               Next.js 14 application
+│   └── src/app/
+│       ├── chat/           Primary chat UI (page + Suspense wrapper)
+│       ├── jobs/           Job detail drill-down and task tree
+│       └── components/     Navbar  Sidebar
 ├── infra/
-│   ├── init.sql            # PostgreSQL schema (fresh install)
-│   ├── migrate_m4.sql      # M3 → M4 migration (execution audit fields)
-│   ├── migrate_m6.sql      # M5 → M6 migration (users, workspaces, workspace_id)
-│   ├── prometheus.yml      # Prometheus scrape config
-│   └── grafana/            # Grafana provisioning (datasource + dashboard)
-├── requirements-dev.txt
-└── docker-compose.yml
+│   ├── init.sql            Canonical DB schema (source of truth)
+│   ├── nginx/              Production reverse proxy config
+│   ├── prometheus.yml      Scrape configuration
+│   └── grafana/            Pre-provisioned datasource + dashboard JSON
+├── docker-compose.yml      Local development
+└── docker-compose.prod.yml Production (TLS, no public internal ports)
 ```
 
 ---
 
-## Design Decisions
+## Observability
 
-**Why MockPlanner?** Same interface as OpenAIPlanner — all downstream code exercises the real path. Switching to a live LLM is a single env-var change.
+Prometheus scrapes `/metrics` from the API and the worker. Grafana loads a pre-provisioned dashboard on first start that shows:
 
-**Why `json_object` mode over OpenAI Structured Outputs?** Available on all current OpenAI models; broader compatibility than JSON Schema mode.
+- Task executions per second by type (`tool_call`, `synthesis`, `plan`)
+- Task duration histogram (p50 / p95 / p99)
+- Per-tool call counts and latency
+- Task queue wait time (time from `created_at` → worker claim)
+- HTTP request latency by endpoint
+- Task retry and failure rates
 
-**Why `step_id` as a string?** LLM assigns step IDs before DB rows exist. Dependencies use string keys at plan time; executor uses DB UUIDs for task lookup.
-
-**Why two ORM files?** API uses asyncpg; worker uses psycopg2. `infra/init.sql` is the single schema source of truth.
-
-**Why `task_acks_late=True`?** At-least-once delivery — tasks re-queue on worker crash. The atomic claim guard makes re-delivery safe.
-
-**Why `--concurrency=1` in docker-compose?** Keeps all metrics in one process for the demo setup. Increase + set `PROMETHEUS_MULTIPROC_DIR` for production scale.
+No manual dashboard setup is required — the JSON is provisioned via `infra/grafana/provisioning/`.
 
 ---
 
-## Migrating an Existing Database
+## Roadmap
 
-```bash
-# M3 → M4 (attempt_count, started_at, finished_at)
-docker compose exec postgres psql -U agent -d agentdb < infra/migrate_m4.sql
+- **WebSocket / SSE streaming** — push job status updates instead of polling; eliminate the 2-second polling lag
+- **Streaming synthesis** — stream LLM synthesis tokens into the chat bubble as they arrive
+- **More tools** — browser automation, file I/O, structured data queries, HTTP fetch
+- **Multi-turn memory** — inject previous conversation turns into the planner prompt for coherent follow-up prompts
+- **Plan visualisation** — render the dependency DAG interactively before and during execution
+- **Worker auto-scaling** — KEDA or similar to scale Celery workers based on Redis queue depth
+- **Evaluation harness** — automated scoring of planner output quality and end-to-end task success rate
 
-# M5 → M6 (users, workspaces, workspace_id on jobs)
-docker compose exec postgres psql -U agent -d agentdb < infra/migrate_m6.sql
+---
 
-# Clean reset (drops all data):
-docker compose down -v && docker compose up --build
-```
+## License
+
+MIT
