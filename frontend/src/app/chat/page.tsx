@@ -75,6 +75,13 @@ function jobToMessages(detail: JobDetail): Message[] {
   ];
 }
 
+function generateId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return Math.random().toString(36).substring(2) + Date.now().toString(36);
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 function ChatPage() {
@@ -134,8 +141,8 @@ function ChatPage() {
     setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
-    const userId      = crypto.randomUUID();
-    const assistantId = crypto.randomUUID();
+    const userId      = generateId();
+    const assistantId = generateId();
 
     setMessages((prev) => [
       ...prev,
