@@ -22,7 +22,7 @@ export default function RegisterPage() {
       // auto-login after registration
       const res = await login(email, password);
       setToken(res.access_token);
-      router.push("/dashboard");
+      router.push("/chat");
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
