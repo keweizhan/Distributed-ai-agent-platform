@@ -674,14 +674,33 @@ def _llm_synthesize(
 
     context_text = "\n\n".join(context_parts) if context_parts else "(no tool outputs available)"
 
-    synthesis_prompt = (
-        f"You are a helpful AI assistant synthesising the results of an agent pipeline.\n\n"
-        f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
-        f"COMPLETED TOOL OUTPUTS:\n{context_text}\n\n"
-        f"Using the above information, write a clear, complete, and concise final answer "
-        f"to the user's original request. Do not repeat the tool outputs verbatim — "
-        f"synthesise them into a coherent response."
-    )
+    # Use a stricter prompt when the plan included a retrieval step so the LLM
+    # cannot hallucinate information that was not in the user's documents.
+    is_rag_job = any(step.get("tool_name") == "retrieval" for step in collected)
+
+    if is_rag_job:
+        synthesis_prompt = (
+            f"You are a precise assistant that answers questions strictly from provided document excerpts.\n\n"
+            f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
+            f"RETRIEVED DOCUMENT CHUNKS:\n{context_text}\n\n"
+            f"Instructions:\n"
+            f"- Answer ONLY using information explicitly present in the retrieved chunks above.\n"
+            f"- Do NOT use your training knowledge, background knowledge, or any information not in the chunks.\n"
+            f"- Do NOT guess, infer, or fabricate any values, facts, or details.\n"
+            f"- If the retrieved chunks do not contain information relevant to the request, "
+            f"respond with exactly: \"No relevant information found in the knowledge base.\"\n"
+            f"- If only partial information is available, answer what the chunks support "
+            f"and explicitly state what was not found."
+        )
+    else:
+        synthesis_prompt = (
+            f"You are a helpful AI assistant synthesising the results of an agent pipeline.\n\n"
+            f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
+            f"COMPLETED TOOL OUTPUTS:\n{context_text}\n\n"
+            f"Using the above information, write a clear, complete, and concise final answer "
+            f"to the user's original request. Do not repeat the tool outputs verbatim — "
+            f"synthesise them into a coherent response."
+        )
 
     # Try ZhipuAI if configured (takes priority over OpenAI)
     if settings.zhipu_api_key:
