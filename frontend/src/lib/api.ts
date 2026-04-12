@@ -1,5 +1,14 @@
 const BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
+// ── typed API error ────────────────────────────────────────────────────────
+
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 // ── token helpers ──────────────────────────────────────────────────────────
 
 export function getToken(): string | null {
@@ -48,7 +57,7 @@ async function request<T>(path: string, opts: FetchOptions = {}): Promise<T> {
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err?.detail ?? "Request failed");
+    throw new ApiError(err?.detail ?? "Request failed", res.status);
   }
 
   return res.json() as Promise<T>;

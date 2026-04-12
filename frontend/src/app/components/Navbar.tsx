@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
-import { getMe, clearToken, getToken, User } from "@/lib/api";
+import { getMe, clearToken, getToken, ApiError, User } from "@/lib/api";
 
 // Pages where the navbar should not appear
 const AUTH_PATHS = ["/login", "/register"];
@@ -18,9 +18,13 @@ export default function Navbar() {
     if (!getToken()) return;
     getMe()
       .then(setUser)
-      .catch(() => {
-        clearToken();
-        router.push("/login");
+      .catch((err) => {
+        // Only treat a real 401 as "session expired" — network errors and
+        // CORS failures must not wipe a valid token.
+        if (err instanceof ApiError && err.status === 401) {
+          clearToken();
+          router.push("/login");
+        }
       });
   }, [pathname, router]);
 

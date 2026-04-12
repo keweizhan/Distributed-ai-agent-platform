@@ -4,6 +4,7 @@ import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
+  ApiError,
   clearToken,
   createJob,
   deleteDocument,
@@ -211,7 +212,14 @@ function ChatPage() {
   // ── Auth guard ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (!getToken()) { router.replace("/login"); return; }
-    getMe().catch(() => { clearToken(); router.replace("/login"); });
+    getMe().catch((err) => {
+      // Only evict the session on a real 401 — don't wipe a valid token on
+      // transient network errors or CORS failures during initial load.
+      if (err instanceof ApiError && err.status === 401) {
+        clearToken();
+        router.replace("/login");
+      }
+    });
   }, [router]);
 
   // ── Load historical job when ?jobId is present ──────────────────────────
