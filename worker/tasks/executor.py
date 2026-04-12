@@ -674,24 +674,81 @@ def _llm_synthesize(
 
     context_text = "\n\n".join(context_parts) if context_parts else "(no tool outputs available)"
 
-    # Use a stricter prompt when the plan included a retrieval step so the LLM
-    # cannot hallucinate information that was not in the user's documents.
+    # ── RAG detection and context building ───────────────────────────────────
+    # Pull chunks from the retrieval step output so they can be grouped by
+    # source document and presented with clear attribution in the prompt.
+    retrieval_chunks: list[dict] = []
+    for step in collected:
+        if step.get("tool_name") == "retrieval":
+            retrieval_chunks = list((step.get("output") or {}).get("chunks", []))
+            break
+
     is_rag_job = any(step.get("tool_name") == "retrieval" for step in collected)
 
     if is_rag_job:
-        synthesis_prompt = (
-            f"You are a precise assistant that answers questions strictly from provided document excerpts.\n\n"
-            f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
-            f"RETRIEVED DOCUMENT CHUNKS:\n{context_text}\n\n"
-            f"Instructions:\n"
-            f"- Answer ONLY using information explicitly present in the retrieved chunks above.\n"
-            f"- Do NOT use your training knowledge, background knowledge, or any information not in the chunks.\n"
-            f"- Do NOT guess, infer, or fabricate any values, facts, or details.\n"
-            f"- If the retrieved chunks do not contain information relevant to the request, "
-            f"respond with exactly: \"No relevant information found in the knowledge base.\"\n"
-            f"- If only partial information is available, answer what the chunks support "
-            f"and explicitly state what was not found."
+        # Short-circuit: retrieval ran but the knowledge base had nothing relevant.
+        # Skip the LLM call entirely — no chunks means no grounded answer is possible.
+        if not retrieval_chunks:
+            return "No relevant information found in the knowledge base."
+
+        # Group chunks by document title, preserving retrieval-score order within each doc.
+        docs: dict[str, list[dict]] = {}
+        for chunk in retrieval_chunks:
+            title = chunk.get("title") or "Untitled"
+            docs.setdefault(title, []).append(chunk)
+
+        source_titles = list(docs.keys())
+        is_multi_doc = len(source_titles) > 1
+
+        # Build a source-labelled context block with per-chunk section markers.
+        rag_lines: list[str] = []
+        for title, chunks in docs.items():
+            rag_lines.append(f'[Source: "{title}"]')
+            for chunk in chunks:
+                idx = chunk.get("chunk_index", 0)
+                text = (chunk.get("text") or "").strip()
+                rag_lines.append(f"  §{idx}: {text}")
+        rag_context = "\n".join(rag_lines)
+
+        # Grounding rules shared by both single- and multi-doc prompts.
+        grounding_rules = (
+            "- Answer ONLY using information explicitly present in the retrieved chunks above.\n"
+            "- Do NOT use your training knowledge, background knowledge, or any information "
+            "not in the chunks.\n"
+            "- Do NOT guess, infer, or fabricate any values, facts, or details.\n"
+            "- If the chunks do not contain information relevant to the request, "
+            "respond with exactly:\n"
+            '  "No relevant information found in the knowledge base."\n'
+            "- If only partial information is available, answer what the chunks support "
+            "and explicitly state what was not found."
         )
+
+        if is_multi_doc:
+            source_list = ", ".join(f'"{t}"' for t in source_titles)
+            synthesis_prompt = (
+                f"You are a precise assistant that synthesises information from multiple "
+                f"retrieved documents.\n\n"
+                f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
+                f"RETRIEVED CHUNKS FROM {len(source_titles)} DOCUMENTS ({source_list}):\n"
+                f"{rag_context}\n\n"
+                f"Instructions:\n"
+                f"{grounding_rules}\n"
+                f"- When multiple sources agree on a fact, state it once and note which "
+                f"sources support it.\n"
+                f"- When sources conflict or contradict each other, explicitly describe "
+                f"the conflict and name the sources involved.\n"
+                f"- When sources cover different aspects, combine them into a coherent "
+                f"answer and attribute each part to its source."
+            )
+        else:
+            synthesis_prompt = (
+                f"You are a precise assistant that answers questions strictly from the "
+                f"provided document excerpts.\n\n"
+                f"ORIGINAL USER REQUEST:\n{job_prompt}\n\n"
+                f'RETRIEVED CHUNKS FROM "{source_titles[0]}":\n{rag_context}\n\n'
+                f"Instructions:\n"
+                f"{grounding_rules}"
+            )
     else:
         synthesis_prompt = (
             f"You are a helpful AI assistant synthesising the results of an agent pipeline.\n\n"
