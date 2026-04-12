@@ -1,6 +1,7 @@
 """Pydantic schemas for document ingestion and listing."""
 
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +20,7 @@ class IngestDocumentResponse(BaseModel):
 
 class DocumentRecord(BaseModel):
     """One row returned by GET /documents."""
-    id: str
+    id: UUID
     title: str
     chunk_count: int
     status: str        # ingesting | ready | failed
