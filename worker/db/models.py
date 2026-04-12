@@ -74,3 +74,14 @@ class TaskModel(Base):
 
     job    = relationship("JobModel", back_populates="tasks")
     parent = relationship("TaskModel", remote_side="TaskModel.id", backref="children")
+
+
+class DocumentModel(Base):
+    __tablename__ = "documents"
+
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), nullable=False)
+    title        = Column(String(500), nullable=False)
+    chunk_count  = Column(Integer, nullable=False, default=0)
+    status       = Column(String(20), nullable=False, default="ingesting")
+    created_at   = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

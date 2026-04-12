@@ -158,3 +158,61 @@ export async function cancelJob(id: string): Promise<Job> {
 export async function deleteJob(id: string): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>(`/jobs/${id}`, { method: "DELETE" });
 }
+
+// ── document endpoints ─────────────────────────────────────────────────────
+
+export type IngestDocumentResponse = {
+  document_id: string;
+  status: string;
+  title: string;
+  chunk_count: number;
+};
+
+export type DocumentRecord = {
+  id: string;
+  title: string;
+  chunk_count: number;
+  status: "ingesting" | "ready" | "failed";
+  created_at: string;
+};
+
+export async function ingestDocument(
+  title: string,
+  content: string
+): Promise<IngestDocumentResponse> {
+  return request<IngestDocumentResponse>("/documents", {
+    method: "POST",
+    body: { title, content },
+  });
+}
+
+export async function listDocuments(): Promise<DocumentRecord[]> {
+  return request<DocumentRecord[]>("/documents");
+}
+
+export async function uploadDocument(
+  file: File,
+  title: string,
+): Promise<IngestDocumentResponse> {
+  // multipart/form-data — cannot use the JSON request() helper
+  const token = getToken();
+  const form = new FormData();
+  form.append("file", file);
+  form.append("title", title);
+
+  const res = await fetch(`${BASE}/documents/upload`, {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err?.detail ?? "Upload failed");
+  }
+  return res.json() as Promise<IngestDocumentResponse>;
+}
+
+export async function deleteDocument(id: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/documents/${id}`, { method: "DELETE" });
+}

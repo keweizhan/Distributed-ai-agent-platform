@@ -44,9 +44,10 @@ services:
     volumes:
       - ./api:/app/api
       - ./shared:/app/shared
+      - ./alembic.ini:/app/alembic.ini:ro
     environment:
       - PYTHONPATH=/app
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    command: sh -c "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 10s

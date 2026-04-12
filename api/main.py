@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.session import get_db
 from api.metrics import http_request_duration_seconds
-from api.routers import auth, jobs
+from api.routers import auth, documents, jobs
 
 app = FastAPI(
     title="Distributed AI Agent Platform",
@@ -41,6 +41,14 @@ app = FastAPI(
             ),
         },
         {
+            "name": "documents",
+            "description": (
+                "Ingest documents for RAG retrieval. "
+                "Documents are chunked and embedded asynchronously; "
+                "the agent's 'retrieval' tool can then surface relevant chunks as context."
+            ),
+        },
+        {
             "name": "meta",
             "description": "Liveness and readiness probes.",
         },
@@ -56,6 +64,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(jobs.router)
+app.include_router(documents.router)
 
 
 # ---------------------------------------------------------------------------

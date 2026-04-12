@@ -1,11 +1,11 @@
 """
 SQLAlchemy ORM models for the API service.
-infra/init.sql is the single source of truth for the DB schema.
+Schema is managed by Alembic migrations in api/migrations/versions/.
 """
 
 import uuid
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, Column, DateTime, Enum, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -106,3 +106,23 @@ class TaskModel(Base):
 
     job    = relationship("JobModel", back_populates="tasks")
     parent = relationship("TaskModel", remote_side="TaskModel.id", backref="children")
+
+
+# ---------------------------------------------------------------------------
+# RAG document metadata
+# ---------------------------------------------------------------------------
+
+class DocumentModel(Base):
+    __tablename__ = "documents"
+    __table_args__ = (
+        CheckConstraint("status IN ('ingesting','ready','failed')", name="ck_documents_status"),
+    )
+
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    title        = Column(String(500), nullable=False)
+    chunk_count  = Column(Integer, nullable=False, default=0)
+    status       = Column(String(20), nullable=False, default="ingesting")
+    created_at   = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    workspace = relationship("WorkspaceModel")

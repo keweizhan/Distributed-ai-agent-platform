@@ -10,6 +10,28 @@ from __future__ import annotations
 from worker.tools.registry import list_tools
 
 # ---------------------------------------------------------------------------
+# Per-tool descriptions shown to the LLM so it knows when to use each one
+# ---------------------------------------------------------------------------
+
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "web_search": (
+        "Search the public internet for current information. "
+        "tool_input: {\"query\": \"<search query>\", \"max_results\": <int, optional>}"
+    ),
+    "code_exec": (
+        "Execute a Python code snippet in a sandbox and return stdout. "
+        "tool_input: {\"code\": \"<python source>\", \"timeout\": <int seconds, optional>}"
+    ),
+    "retrieval": (
+        "Search documents the user has already uploaded to their knowledge base. "
+        "Use this — NOT web_search — when the prompt refers to uploaded files, "
+        "internal documents, or the user's own data. "
+        "tool_input: {\"query\": \"<search query>\", \"top_k\": <int, optional, default 5>}. "
+        "Do NOT include workspace_id — it is injected automatically by the executor."
+    ),
+}
+
+# ---------------------------------------------------------------------------
 # System prompt — instructs the LLM on its role and the exact output contract
 # ---------------------------------------------------------------------------
 
@@ -45,8 +67,15 @@ Rules:
 - The last step should always be a synthesis step (task_type=synthesis, tool_name=null) \
 that aggregates prior results into a final answer.
 - Use only tools from the AVAILABLE TOOLS list.
-- tool_input must be a JSON object (never null — use {{}} if empty).
+- tool_input must be a JSON object (never null — use {} if empty).
 - Generate between 2 and 8 steps. Do not over-decompose.
+- Tool selection guidance:
+    * Use "retrieval" when the user asks about uploaded files, their own documents, \
+or internal knowledge base content. Do NOT use web_search for these queries.
+    * Use "web_search" for general internet searches and current public information.
+    * Use "code_exec" for computation, data processing, or running Python code.
+    * retrieval tool_input must contain "query" and optionally "top_k". \
+Never include workspace_id — it is injected automatically.
 """
 
 
@@ -59,7 +88,16 @@ def build_user_prompt(prompt: str, context: list[str] | None = None) -> str:
     work on similar tasks.
     """
     tools = list_tools()
-    tool_list = "\n".join(f"  - {t}" for t in tools) if tools else "  (none registered yet)"
+
+    # Annotate each tool name with its description when available
+    tool_lines: list[str] = []
+    for t in tools:
+        desc = TOOL_DESCRIPTIONS.get(t)
+        if desc:
+            tool_lines.append(f"  - {t}: {desc}")
+        else:
+            tool_lines.append(f"  - {t}")
+    tool_list = "\n".join(tool_lines) if tool_lines else "  (none registered yet)"
 
     context_section = ""
     if context:

@@ -19,6 +19,7 @@ app = Celery(
     include=[
         "worker.tasks.planner",
         "worker.tasks.executor",
+        "worker.tasks.ingest",
     ],
 )
 

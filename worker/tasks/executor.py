@@ -185,7 +185,12 @@ def execute_step(self, task_id: str) -> dict[str, Any]:  # type: ignore[override
         tool_name = task_tool_name or "synthesis"
         tool_start = time.monotonic()
         try:
-            output = _invoke_tool(task, memory_context=memory_context, session=session)
+            output = _invoke_tool(
+                task,
+                memory_context=memory_context,
+                session=session,
+                workspace_id=workspace_id,
+            )
         except ToolError as exc:
             metrics.tool_calls_total.labels(tool_name=tool_name, status="failed").inc()
             metrics.task_executions_total.labels(
@@ -326,6 +331,7 @@ def _invoke_tool(
     task: TaskModel,
     memory_context: list[str] | None = None,
     session: Session | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Resolve and call the registered tool for this task.
@@ -374,7 +380,10 @@ def _invoke_tool(
         )
 
     tool_fn = get_tool(task.tool_name)  # raises ToolError for unknown names
-    tool_input: dict[str, Any] = task.tool_input or {}
+    tool_input: dict[str, Any] = dict(task.tool_input or {})
+    # Inject workspace context so tools like "retrieval" can scope their queries.
+    # All existing tools accept **_ so this is safe for any registered tool.
+    tool_input["_workspace_id"] = workspace_id or ""
     return tool_fn(**tool_input)
 
 

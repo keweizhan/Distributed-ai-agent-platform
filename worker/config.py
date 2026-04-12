@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     qdrant_collection: str = "agent_memory"
     embedding_model: str = "text-embedding-3-small"
 
+    # RAG document store — always active when Qdrant is reachable
+    rag_collection: str = "rag_documents"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
